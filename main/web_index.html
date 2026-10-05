@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>串口记录仪</title>
+<style>
+body{font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#0f1419;color:#e8eef5}
+header,main{padding:12px}
+h1{font-size:20px;margin:0 0 6px}
+h2{font-size:16px;margin:0 0 8px}
+.card{background:#1b2430;border-radius:10px;padding:10px;margin:10px 0}
+label{display:block;margin:6px 0;color:#b7c3d1}
+select,input,button{font-size:16px}
+input{width:64px;padding:6px;border-radius:6px;border:0}
+button{background:#2f6fed;color:#fff;border:0;border-radius:8px;padding:12px 14px;margin:6px 6px 0 0}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.muted{color:#9aa8b8}
+.line{display:flex;align-items:center;gap:8px;margin:8px 0}
+.item{flex:1;display:block;color:#d7e6ff;text-decoration:none;background:#243044;border-radius:8px;padding:12px}
+.pick{width:22px;height:22px}
+#crumb a{color:#8ec5ff;margin-right:4px}
+.msg{min-height:1.2em;color:#ffd27a}
+#live{height:240px;overflow:auto;background:#0b0f14;padding:8px;white-space:pre-wrap;font:13px/1.35 ui-monospace,monospace}
+</style>
+</head>
+<body>
+<header>
+<h1>串口记录仪</h1>
+<div id="info" class="muted">正在读取...</div>
+</header>
+<main>
+<div id="ports"></div>
+<div class="card">
+<h2>串口透传</h2>
+<div class="muted">WiFi TCP：用电脑 TCP 工具连接 192.168.4.1 对应端口即可双向透传。蓝牙为 BLE UART(NUS)，手机需用 BLE 调试工具(如 nRF Connect) 连接。</div>
+<div id="bridge"></div>
+<div id="bridge-msg" class="msg"></div>
+</div>
+<div class="card">
+<h2>实时数据</h2>
+<div class="row">
+<label><input id="lv0" class="pick" type="checkbox"> U0</label>
+<label><input id="lv1" class="pick" type="checkbox" checked> J2</label>
+<label><input id="lv2" class="pick" type="checkbox" checked> J3</label>
+<button type="button" id="lv-clear">清空</button>
+</div>
+<pre id="live"></pre>
+</div>
+<div class="card">
+<h2>校时</h2>
+<div class="row">
+<label>年 <input id="yy" inputmode="numeric"></label>
+<label>月 <input id="mo" inputmode="numeric"></label>
+<label>日 <input id="dd" inputmode="numeric"></label>
+</div>
+<div class="row">
+<label>时 <input id="hh" inputmode="numeric"></label>
+<label>分 <input id="mm" inputmode="numeric"></label>
+<label>秒 <input id="ss" inputmode="numeric"></label>
+</div>
+<button type="button" id="btn-time">校时</button>
+<button type="button" id="btn-phone">用手机时间</button>
+<div id="time-msg" class="msg"></div>
+</div>
+<div class="card">
+<h2>日志文件</h2>
+<div id="crumb" class="muted"></div>
+<button type="button" id="btn-all">全选</button>
+<button type="button" id="btn-zip">下载选中</button>
+<button type="button" id="btn-zipall">下载全部</button>
+<div id="files"></div>
+<div id="file-msg" class="msg"></div>
+</div>
+</main>
+<script>
+const names=["U0 板载","J2","J3"];
+const bauds=[115200,9600,19200,38400,57600,230400,460800,921600,4800,2400,1200];
+let cur="/sdcard";
+let ports=[];
+function opts(list,val){
+  return list.map(function(v){
+    return '<option value="'+v+'"'+(String(v)===String(val)?' selected':'')+'>'+v+'</option>';
+  }).join('');
+}
+function show(id,text){var el=document.getElementById(id); if(el) el.textContent=text||'';}
+function fillTime(text){
+  var m=/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/.exec(text||'');
+  if(!m) return;
+  document.getElementById('yy').value=m[1];
+  document.getElementById('mo').value=String(Number(m[2]));
+  document.getElementById('dd').value=String(Number(m[3]));
+  document.getElementById('hh').value=String(Number(m[4]));
+  document.getElementById('mm').value=String(Number(m[5]));
+  document.getElementById('ss').value=String(Number(m[6]));
+}
+function renderPorts(){
+  document.getElementById('ports').innerHTML=ports.map(function(p,i){
+    var st=p.open?('已打开 TX '+p.tx+' RX '+p.rx):(p.err?('失败 '+p.err):'已关闭');
+    return '<div class="card" id="p'+i+'"><b>'+names[i]+'</b> <span class="st">'+st+'</span>'
+      +'<label>波特率 <select class="baud">'+opts(bauds,p.baud)+'</select></label>'
+      +'<div class="row"><label>数据位 <select class="bits">'+opts([8,7,6,5],p.bits)+'</select></label>'
+      +'<label>停止位 <select class="stop">'+opts(['1','1.5','2'],p.stop)+'</select></label>'
+      +'<label>校验 <select class="par">'+opts(['N','E','O'],p.parity)+'</select></label></div>'
+      +'<button type="button" data-act="toggle" data-i="'+i+'">'+(p.on?'关闭串口':'打开串口')+'</button>'
+      +'<button type="button" data-act="apply" data-i="'+i+'">应用参数</button>'
+      +'<div class="msg" id="m'+i+'"></div></div>';
+  }).join('');
+}
+async function loadStatus(fill){
+  try{
+    const s=await (await fetch('/api/status')).json();
+    show('info', s.time+'  '+(s.sd?('SD '+s.free_mb+' MB'):'无卡')+'  '+s.ssid);
+    if(fill){
+      ports=s.ports;
+      renderPorts();
+      fillTime(s.time);
+    }else{
+      s.ports.forEach(function(p,i){
+        ports[i].open=p.open; ports[i].tx=p.tx; ports[i].rx=p.rx; ports[i].err=p.err; ports[i].on=p.on;
+        var el=document.querySelector('#p'+i+' .st');
+        if(el) el.textContent=p.open?('已打开 TX '+p.tx+' RX '+p.rx):(p.err?('失败 '+p.err):'已关闭');
+        var btn=document.querySelector('#p'+i+' button[data-act="toggle"]');
+        if(btn) btn.textContent=p.on?'关闭串口':'打开串口';
+      });
+    }
+  }catch(e){
+    show('info','读取失败');
+  }
+}
+function cardParams(i, on){
+  var card=document.getElementById('p'+i);
+  return new URLSearchParams({
+    index:String(i),
+    baud:card.querySelector('.baud').value,
+    bits:card.querySelector('.bits').value,
+    stop:card.querySelector('.stop').value,
+    parity:card.querySelector('.par').value,
+    on:on
+  });
+}
+async function savePort(i, on){
+  show('m'+i,'请稍候');
+  try{
+    const r=await fetch('/api/port?'+cardParams(i,on).toString());
+    const j=await r.json();
+    show('m'+i, j.ok?(on==='1'?'已打开':'已关闭'):(j.err||'失败'));
+    if(j.ok){ ports[i].on=(on==='1'); }
+    await loadStatus(false);
+  }catch(e){
+    show('m'+i,'无响应');
+  }
+}
+document.getElementById('ports').addEventListener('click', function(ev){
+  var node=ev.target;
+  while(node && node.tagName!=='BUTTON') node=node.parentNode;
+  if(!node || !node.dataset) return;
+  var i=Number(node.dataset.i);
+  if(node.dataset.act==='toggle'){
+    savePort(i, ports[i] && ports[i].on ? '0' : '1');
+  }else if(node.dataset.act==='apply'){
+    savePort(i, (ports[i] && ports[i].on) ? '1' : '0');
+  }
+});
+document.getElementById('btn-time').addEventListener('click', async function(){
+  show('time-msg','请稍候');
+  var body=new URLSearchParams({
+    y:document.getElementById('yy').value,
+    mo:document.getElementById('mo').value,
+    d:document.getElementById('dd').value,
+    h:document.getElementById('hh').value,
+    mi:document.getElementById('mm').value,
+    s:document.getElementById('ss').value
+  });
+  try{
+    const r=await fetch('/api/time?'+body.toString());
+    const j=await r.json();
+    show('time-msg', j.ok?('校时成功 '+j.time):(j.err||'日期无效'));
+    if(j.ok) show('info', j.time);
+  }catch(e){
+    show('time-msg','无响应');
+  }
+});
+function safeDir(path){
+  if(!path || path.indexOf('/sdcard')!==0 || path.indexOf('..')>=0) return '/sdcard';
+  return path;
+}
+function upPath(path){
+  path=safeDir(path);
+  if(path==='/sdcard') return '/sdcard';
+  var i=path.lastIndexOf('/');
+  return i<=7?'/sdcard':path.slice(0,i);
+}
+function renderCrumb(path){
+  var box=document.getElementById('crumb');
+  box.innerHTML='';
+  var acc='';
+  path.split('/').forEach(function(part){
+    if(!part) return;
+    acc+='/'+part;
+    if(box.childNodes.length){
+      var sep=document.createElement('span');
+      sep.textContent=' / ';
+      box.appendChild(sep);
+    }
+    var a=document.createElement('a');
+    a.textContent=part;
+    a.href='/?dir='+encodeURIComponent(acc);
+    a.setAttribute('data-dir','1');
+    a.setAttribute('data-path',acc);
+    box.appendChild(a);
+  });
+}
+async function loadFiles(path){
+  cur=safeDir(path);
+  show('file-msg','');
+  try{
+    const r=await fetch('/api/files?path='+encodeURIComponent(cur));
+    const s=await r.json();
+    if(s.err){ show('file-msg', s.err); }
+    var shown=safeDir(s.path||cur);
+    cur=shown;
+    renderCrumb(shown);
+    var box=document.getElementById('files');
+    box.innerHTML='';
+    if(shown!=='/sdcard'){
+      var back=document.createElement('a');
+      back.className='item';
+      back.textContent='.. 返回';
+      back.href='/?dir='+encodeURIComponent(upPath(shown));
+      back.setAttribute('data-dir','1');
+      back.setAttribute('data-path', upPath(shown));
+      var line0=document.createElement('div');
+      line0.className='line';
+      line0.appendChild(back);
+      box.appendChild(line0);
+    }
+    (s.items||[]).forEach(function(it){
+      var full=shown+'/'+it.name;
+      var line=document.createElement('div');
+      line.className='line';
+      if(!it.dir){
+        var ck=document.createElement('input');
+        ck.type='checkbox';
+        ck.className='pick';
+        ck.setAttribute('data-name', it.name);
+        line.appendChild(ck);
+      }
+      var a=document.createElement('a');
+      a.className='item';
+      if(it.dir){
+        a.textContent=it.name+'/';
+        a.href='/?dir='+encodeURIComponent(full);
+        a.setAttribute('data-dir','1');
+        a.setAttribute('data-path', full);
+      }else{
+        a.textContent=it.name+'  '+it.size;
+        a.href='/dl?path='+encodeURIComponent(full);
+      }
+      line.appendChild(a);
+      box.appendChild(line);
+    });
+    if(!(s.items||[]).length){
+      var empty=document.createElement('div');
+      empty.className='muted';
+      empty.textContent='空';
+      box.appendChild(empty);
+    }
+  }catch(e){
+    show('file-msg','目录读取失败');
+  }
+}
+function onDirClick(ev){
+  var node=ev.target;
+  while(node && node.tagName!=='A') node=node.parentNode;
+  if(!node || node.getAttribute('data-dir')!=='1') return;
+  ev.preventDefault();
+  loadFiles(node.getAttribute('data-path'));
+}
+document.getElementById('crumb').addEventListener('click', onDirClick);
+document.getElementById('files').addEventListener('click', onDirClick);
+document.getElementById('btn-all').addEventListener('click', function(){
+  var boxes=document.querySelectorAll('#files .pick');
+  var mark=false;
+  for(var i=0;i<boxes.length;i++){ if(!boxes[i].checked) mark=true; }
+  for(var j=0;j<boxes.length;j++) boxes[j].checked=mark;
+});
+function selectedNames(){
+  var names=[];
+  var boxes=document.querySelectorAll('#files .pick');
+  for(var i=0;i<boxes.length;i++){
+    if(boxes[i].checked) names.push(boxes[i].getAttribute('data-name'));
+  }
+  return {names:names, total:boxes.length};
+}
+document.getElementById('btn-zip').addEventListener('click', function(){
+  var sel=selectedNames();
+  if(!sel.names.length){ show('file-msg','请选择文件'); return; }
+  if(sel.names.length===sel.total){
+    window.location.href='/api/zip?dir='+encodeURIComponent(cur)+'&all=1';
+    return;
+  }
+  var q='/api/zip?dir='+encodeURIComponent(cur)+'&names='+encodeURIComponent(sel.names.join('|'));
+  if(q.length>1500){ show('file-msg','选中太多,请用下载全部'); return; }
+  window.location.href=q;
+});
+document.getElementById('btn-zipall').addEventListener('click', function(){
+  window.location.href='/api/zip?dir='+encodeURIComponent(cur)+'&all=1';
+});
+document.getElementById('btn-phone').addEventListener('click', async function(){
+  var d=new Date();
+  document.getElementById('yy').value=d.getFullYear();
+  document.getElementById('mo').value=d.getMonth()+1;
+  document.getElementById('dd').value=d.getDate();
+  document.getElementById('hh').value=d.getHours();
+  document.getElementById('mm').value=d.getMinutes();
+  document.getElementById('ss').value=d.getSeconds();
+  show('time-msg','请稍候');
+  var body=new URLSearchParams({
+    y:d.getFullYear(), mo:d.getMonth()+1, d:d.getDate(),
+    h:d.getHours(), mi:d.getMinutes(), s:d.getSeconds()
+  });
+  try{
+    const r=await fetch('/api/time?'+body.toString());
+    const j=await r.json();
+    show('time-msg', j.ok?('校时成功 '+j.time):(j.err||'日期无效'));
+    if(j.ok) show('info', j.time);
+  }catch(e){
+    show('time-msg','无响应');
+  }
+});
+
+
+let liveCursor=[0,0,0];
+document.getElementById('lv-clear').addEventListener('click', function(){
+  document.getElementById('live').textContent='';
+  liveCursor=[0,0,0];
+});
+async function pollLive(){
+  var q=[];
+  for(var i=0;i<3;i++){
+    var box=document.getElementById('lv'+i);
+    if(box && box.checked) q.push(i+'='+liveCursor[i]);
+  }
+  if(!q.length) return;
+  try{
+    const s=await (await fetch('/api/live?'+q.join('&'))).json();
+    var view=document.getElementById('live');
+    var stick=view.scrollTop+view.clientHeight>=view.scrollHeight-24;
+    (s.ports||[]).forEach(function(p){
+      liveCursor[p.i]=p.next;
+      if(p.text) view.textContent+=p.text;
+    });
+    if(view.textContent.length>24000) view.textContent=view.textContent.slice(-14000);
+    if(stick) view.scrollTop=view.scrollHeight;
+  }catch(e){}
+}
+
+loadStatus(true);
+var startDir='/sdcard';
+try{ var qs=new URLSearchParams(location.search); startDir=safeDir(qs.get('dir')||'/sdcard'); }catch(e){}
+loadFiles(startDir);
+setInterval(function(){loadStatus(false);},2000);
+setInterval(pollLive,500);
+
+function apiGet(url){ return fetch(url).then(function(r){return r.json();}); }
+function renderBridge(){
+  apiGet('/api/bridge').then(function(b){
+    var labels=['U0','J2','J3'];
+    var rows=b.tcp.map(function(t,i){
+      return '<div class="line"><b style="width:34px">'+labels[i]+'</b>'
+        +'<label>TCP端口 <input class="bport" style="width:90px" value="'+t.port+'"></label>'
+        +'<button type="button" class="btcp" data-i="'+i+'">'+(t.on?('停止(客户端'+t.clients+')'):'开启TCP')+'</button>'
+        +'<span class="muted">收'+t.rx+' 发'+t.tx+'</span></div>';
+    }).join('');
+    var ble=b.ble;
+    rows+='<div class="line"><b style="width:34px">BLE</b>'
+      +'<label>绑定 <select id="ble-port"><option value="0">U0</option><option value="1"'+(ble.port===1?' selected':'')+'>J2</option><option value="2"'+(ble.port===2?' selected':'')+'>J3</option></select></label>'
+      +'<label>名称 <input id="ble-name" style="width:120px" value="'+ble.name+'"></label>'
+      +'<button type="button" id="b-ble">'+(ble.on?(ble.connected?'已连接,停止':'广播中,停止'):'开启BLE')+'</button>'
+      +'<span class="muted">收'+ble.rx+' 发'+ble.tx+'</span></div>';
+    document.getElementById('bridge').innerHTML=rows;
+    Array.prototype.forEach.call(document.querySelectorAll('.btcp'),function(btn){
+      btn.onclick=function(){
+        var i=btn.getAttribute('data-i');
+        var on=btn.textContent.indexOf('开启')===0;
+        var port=btn.parentElement.querySelector('.bport').value;
+        apiGet('/api/bridge_tcp?index='+i+'&on='+(on?1:0)+'&port='+port).then(function(r){
+          show('bridge-msg',r.ok?'已更新':('失败 '+(r.err||''))); renderBridge();
+        });
+      };
+    });
+    document.getElementById('b-ble').onclick=function(){
+      var on=document.getElementById('b-ble').textContent.indexOf('开启')===0;
+      var p=document.getElementById('ble-port').value;
+      var nm=encodeURIComponent(document.getElementById('ble-name').value);
+      apiGet('/api/bridge_ble?index='+p+'&on='+(on?1:0)+'&name='+nm).then(function(r){
+        show('bridge-msg',r.ok?'已更新':('失败 '+(r.err||''))); renderBridge();
+      });
+    };
+  });
+}
+
+setInterval(renderBridge, 3000);
+</script>
+</body>
+</html>
