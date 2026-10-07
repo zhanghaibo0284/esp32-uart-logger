@@ -13,7 +13,8 @@ static const char *NVS_NS = "logger";
 static const char *NVS_KEY = "cfg";
 
 #define CFG_MAGIC 0x4C4F4731u
-#define CFG_VERSION 2
+#define CFG_VERSION 3
+#define V2_BLOB_SIZE 32   // size of the version-2 blob (without screen_auto_off)
 
 typedef struct {
     uint32_t magic;
@@ -24,6 +25,7 @@ typedef struct {
     uint8_t stop_bits[APP_PORT_COUNT];
     uint8_t parity[APP_PORT_COUNT];
     uint8_t enabled[APP_PORT_COUNT];
+    uint8_t screen_auto_off;
 } cfg_blob_t;
 
 static app_settings_t s_cfg;
@@ -33,6 +35,7 @@ static void set_defaults(app_settings_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     cfg->segment_min = 60;
+    cfg->screen_auto_off = true;
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         cfg->port[i].baud = 115200;
         cfg->port[i].data_bits = UART_DATA_8_BITS;
@@ -50,7 +53,8 @@ static bool baud_ok(uint32_t baud)
 
 static bool blob_ok(const cfg_blob_t *blob)
 {
-    if (blob->magic != CFG_MAGIC || blob->version != CFG_VERSION) {
+    if (blob->magic != CFG_MAGIC ||
+        (blob->version != 2 && blob->version != CFG_VERSION)) {
         return false;
     }
     if (blob->segment_min < 1 || blob->segment_min > 24 * 60) {
@@ -78,6 +82,8 @@ static bool blob_ok(const cfg_blob_t *blob)
 static void from_blob(const cfg_blob_t *blob, app_settings_t *cfg)
 {
     cfg->segment_min = blob->segment_min;
+    // v2 blobs have no stored flag (read buffer zeroed); default to enabled.
+    cfg->screen_auto_off = blob->version == 2 ? true : blob->screen_auto_off != 0;
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         cfg->port[i].baud = blob->baud[i];
         cfg->port[i].data_bits = (uart_word_length_t)blob->data_bits[i];
@@ -93,6 +99,7 @@ static void to_blob(const app_settings_t *cfg, cfg_blob_t *blob)
     blob->magic = CFG_MAGIC;
     blob->version = CFG_VERSION;
     blob->segment_min = cfg->segment_min;
+    blob->screen_auto_off = cfg->screen_auto_off ? 1 : 0;
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         blob->baud[i] = cfg->port[i].baud;
         blob->data_bits[i] = (uint8_t)cfg->port[i].data_bits;
@@ -138,12 +145,15 @@ void app_settings_init(void)
         return;
     }
     cfg_blob_t blob;
+    memset(&blob, 0, sizeof(blob));
     size_t size = sizeof(blob);
     esp_err_t err = nvs_get_blob(handle, NVS_KEY, &blob, &size);
     nvs_close(handle);
-    if (err == ESP_OK && size == sizeof(blob) && blob_ok(&blob)) {
+    bool size_ok = size == sizeof(blob) || size == V2_BLOB_SIZE;
+    if (err == ESP_OK && size_ok && blob_ok(&blob)) {
         from_blob(&blob, &s_cfg);
-        ESP_LOGI(TAG, "settings loaded, segment=%u min", s_cfg.segment_min);
+        ESP_LOGI(TAG, "settings loaded v%u, segment=%u auto_off=%d",
+                 blob.version, s_cfg.segment_min, s_cfg.screen_auto_off ? 1 : 0);
     } else {
         ESP_LOGW(TAG, "settings invalid, use defaults");
     }

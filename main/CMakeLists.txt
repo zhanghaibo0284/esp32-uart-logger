@@ -13,6 +13,7 @@ idf_component_register(SRCS
                        "app_bridge.c"
                        "app_modbus.c"
                        "app_config.c"
+                       "app_screen.c"
                        "dns_server.c"
                        "font_cn_16.c"
                     INCLUDE_DIRS "."

@@ -15,6 +15,7 @@ typedef struct {
 
 typedef struct {
     uint16_t segment_min;
+    bool screen_auto_off;  // auto turn screen off after inactivity
     port_setting_t port[APP_PORT_COUNT];
 } app_settings_t;
 

@@ -117,20 +117,20 @@ static esp_err_t bridge_status_get(httpd_req_t *req)
                      "{\"tcp\":[");
     for (int i = 0; i < APP_PORT_COUNT && n > 0; i++) {
         n += snprintf(body + n, sizeof(body) - (size_t)n,
-                      "%s{\"on\":%s,\"port\":%u,\"clients\":%d,\"rx\":%lu,\"tx\":%lu}",
+                      "%s{\"on\":%s,\"port\":%u,\"clients\":%d,\"rx\":%llu,\"tx\":%llu}",
                       i ? "," : "",
                       info.tcp_on[i] ? "true" : "false",
                       info.tcp_port[i], info.tcp_clients[i],
-                      (unsigned long)info.tcp_rx[i],
-                      (unsigned long)info.tcp_tx[i]);
+                      (unsigned long long)info.tcp_rx[i],
+                      (unsigned long long)info.tcp_tx[i]);
     }
     n += snprintf(body + n, sizeof(body) - (size_t)n,
-                  "],\"ble\":{\"on\":%s,\"connected\":%s,\"port\":%d,\"rx\":%lu,\"tx\":%lu,\"name\":\"%s\"}}",
+                  "],\"ble\":{\"on\":%s,\"connected\":%s,\"port\":%d,\"rx\":%llu,\"tx\":%llu,\"name\":\"%s\"}}",
                   info.ble_on ? "true" : "false",
                   info.ble_connected ? "true" : "false",
                   info.ble_port,
-                  (unsigned long)info.ble_rx,
-                  (unsigned long)info.ble_tx,
+                  (unsigned long long)info.ble_rx,
+                  (unsigned long long)info.ble_tx,
                   info.ble_name);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -202,12 +202,12 @@ static esp_err_t status_get(httpd_req_t *req)
                      (unsigned long)view.sd_free_mb, wifi.ssid, wifi.ip);
     for (int i = 0; i < APP_PORT_COUNT && n > 0 && n < (int)sizeof(body) - 80; i++) {
         n += snprintf(body + n, sizeof(body) - (size_t)n,
-                      "%s{\"open\":%s,\"on\":%s,\"tx\":%lu,\"rx\":%lu,\"err\":%d,\"baud\":%lu,\"bits\":%d,\"stop\":\"%s\",\"parity\":\"%s\"}",
+                      "%s{\"open\":%s,\"on\":%s,\"tx\":%llu,\"rx\":%llu,\"err\":%d,\"baud\":%lu,\"bits\":%d,\"stop\":\"%s\",\"parity\":\"%s\"}",
                       i ? "," : "",
                       view.port[i].open ? "true" : "false",
                       cfg.port[i].enabled ? "true" : "false",
-                      (unsigned long)view.port[i].tx_bytes,
-                      (unsigned long)view.port[i].rx_bytes,
+                      (unsigned long long)view.port[i].tx_bytes,
+                      (unsigned long long)view.port[i].rx_bytes,
                       view.port[i].error,
                       (unsigned long)cfg.port[i].baud,
                       bits_of(cfg.port[i].data_bits),

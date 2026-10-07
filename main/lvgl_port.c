@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include "lcd.h"
 #include "touch.h"
+#include "app_screen.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -31,6 +32,7 @@ static void indev_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         last_x = (lv_coord_t)tp_dev.x[0];
         last_y = (lv_coord_t)tp_dev.y[0];
         data->state = LV_INDEV_STATE_PR;
+        app_screen_note_activity();
     } else {
         data->state = LV_INDEV_STATE_REL;
     }

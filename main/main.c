@@ -10,6 +10,7 @@
 #include "app_sd.h"
 #include "app_logger.h"
 #include "app_config.h"
+#include "app_screen.h"
 #include "app_cmd.h"
 #include "app_ui.h"
 #include "app_wifi.h"
@@ -69,6 +70,7 @@ void app_main(void)
     }
     app_bridge_ble_init();
     app_cmd_start();
+    app_screen_start();
     if (app_sd_is_mounted()) {
         app_logger_request_sd_test();
     }

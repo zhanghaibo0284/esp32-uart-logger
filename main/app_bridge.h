@@ -11,13 +11,13 @@ typedef struct {
     bool tcp_on[APP_PORT_COUNT];
     uint16_t tcp_port[APP_PORT_COUNT];
     int tcp_clients[APP_PORT_COUNT];
-    uint32_t tcp_rx[APP_PORT_COUNT];
-    uint32_t tcp_tx[APP_PORT_COUNT];
+    uint64_t tcp_rx[APP_PORT_COUNT];  // 64-bit: overflow-proof at any rate
+    uint64_t tcp_tx[APP_PORT_COUNT];
     bool ble_on;
     int ble_port;
     bool ble_connected;
-    uint32_t ble_rx;
-    uint32_t ble_tx;
+    uint64_t ble_rx;
+    uint64_t ble_tx;
     char ble_name[BRIDGE_NAME_LEN + 1];
 } bridge_info_t;
 

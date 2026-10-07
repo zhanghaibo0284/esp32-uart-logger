@@ -11,6 +11,7 @@
 #include "app_time.h"
 #include "app_files.h"
 #include "app_wifi.h"
+#include "app_screen.h"
 #include "xl9555.h"
 
 static const uint32_t BAUD_TABLE[] = {
@@ -523,10 +524,10 @@ static void refresh_cb(lv_timer_t *timer)
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         const char *tag = i == 1 ? "J2" : i == 2 ? "J3" : "U0";
         if (view.port[i].open) {
-            lv_label_set_text_fmt(s_port[i], view.port[i].sending ? "%s 发 TX:%lu RX:%lu" : "%s 开 TX:%lu RX:%lu",
+            lv_label_set_text_fmt(s_port[i], view.port[i].sending ? "%s 发 TX:%llu RX:%llu" : "%s 开 TX:%llu RX:%llu",
                                   tag,
-                                  (unsigned long)view.port[i].tx_bytes,
-                                  (unsigned long)view.port[i].rx_bytes);
+                                  (unsigned long long)view.port[i].tx_bytes,
+                                  (unsigned long long)view.port[i].rx_bytes);
         } else if (view.port[i].error) {
             lv_label_set_text_fmt(s_port[i], "%s 失败 %d", tag, view.port[i].error);
         } else {
@@ -571,13 +572,30 @@ static void refresh_cb(lv_timer_t *timer)
             lv_label_set_text_fmt(s_serial_msg, "%s 已关闭", tag);
         }
     }
+}
 
-    uint8_t key = xl9555_key_scan(0);
-    if (key == KEY0_PRES) {
-        uint16_t act = lv_tabview_get_tab_act(s_tv);
+// Short-press handoff: the screen task (not LVGL-safe) only sets this flag;
+// the tab switch itself runs in the UI task via the timer below.
+static volatile int s_short_pending = -1;
+
+static void short_press_cb(int key, void *arg)
+{
+    (void)arg;
+    s_short_pending = key;
+}
+
+static void short_poll_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    int key = s_short_pending;
+    if (key < 0) {
+        return;
+    }
+    s_short_pending = -1;
+    uint16_t act = lv_tabview_get_tab_act(s_tv);
+    if (key == APP_KEY_K1) {
         lv_tabview_set_act(s_tv, (act + 1) % 6, LV_ANIM_OFF);
-    } else if (key == KEY1_PRES) {
-        uint16_t act = lv_tabview_get_tab_act(s_tv);
+    } else {
         lv_tabview_set_act(s_tv, (act + 5) % 6, LV_ANIM_OFF);
     }
 }
@@ -744,4 +762,6 @@ void app_ui_init(void)
     lv_obj_add_event_cb(s_kb, on_kb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
     lv_timer_create(refresh_cb, 400, NULL);
+    lv_timer_create(short_poll_cb, 50, NULL);
+    app_screen_set_short_press_cb(short_press_cb, NULL);
 }

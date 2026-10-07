@@ -24,7 +24,6 @@ static const char *TAG = "logger";
 
 #define FRAME_BYTES 520         // RTU max 256; ASCII ':' + 512 chars + CRLF
 #define TXQ_DEPTH   2
-#define SNAP_BYTES  2048
 
 typedef struct {
     uint8_t *raw;               // allocated in PSRAM (large)
@@ -68,8 +67,6 @@ static uint32_t s_live_end[APP_PORT_COUNT];
 static char s_sd_msg[48] = "等待SD卡";
 
 // --- config change detection ------------------------------------------------
-static char *s_last_snap;       // PSRAM
-static bool s_snap_inited;
 static int64_t last_cfg_check_us = -2000000;
 
 static void live_append(int index, const char *text)
@@ -601,36 +598,12 @@ static void check_config_changes(int64_t now_us)
     }
     last_cfg_check_us = now_us;
 
-    char *cur = heap_caps_malloc(SNAP_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!cur) {
-        return;
+    // File is compared with the canonical snapshot: any runtime change,
+    // missing field or missing file converges automatically within 2s.
+    bool needs = false;
+    if (app_config_needs_export(&needs) == 0 && needs) {
+        app_config_export();
     }
-    app_config_build_snapshot(cur, SNAP_BYTES);
-
-    if (!s_snap_inited) {
-        s_snap_inited = true;
-        snprintf(s_last_snap, SNAP_BYTES, "%s", cur);
-        app_config_status_t st;
-        app_config_get_status(&st);
-        if (app_sd_is_mounted() && !st.present) {
-            app_config_export();
-        }
-        free(cur);
-        return;
-    }
-
-    if (strcmp(cur, s_last_snap) != 0) {
-        if (app_config_export() == 0) {
-            snprintf(s_last_snap, SNAP_BYTES, "%s", cur);
-        }
-    } else {
-        app_config_status_t st;
-        app_config_get_status(&st);
-        if (app_sd_is_mounted() && !st.present) {
-            app_config_export();
-        }
-    }
-    free(cur);
 }
 
 static void logger_task(void *arg)
@@ -723,7 +696,6 @@ void app_logger_start(void)
     s_lock = xSemaphoreCreateMutex();
 
     // Large buffers live in PSRAM so the internal heap stays intact.
-    s_last_snap = heap_caps_malloc(SNAP_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     int64_t t0 = esp_timer_get_time();
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         s_builder[i].raw = heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);

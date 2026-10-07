@@ -15,10 +15,12 @@ typedef struct {
     struct {
         bool open;
         int error;
-        uint32_t rx_bytes;
-        uint32_t drop_lines;
-        uint32_t tx_frames;
-        uint32_t tx_bytes;
+        // 64-bit high-extension counters: cannot overflow in any real
+        // deployment and need no special handling on the increment path.
+        uint64_t rx_bytes;
+        uint64_t drop_lines;
+        uint64_t tx_frames;
+        uint64_t tx_bytes;
         bool sending;
         char param[24];
         char file_name[24];

@@ -14,6 +14,10 @@ int app_config_load(void);
 // Export current settings to config.json atomically (old file becomes .bak).
 int app_config_export(void);
 
+// needs=true when the file is absent or its content differs from the current
+// settings snapshot (used by automatic change detection).
+int app_config_needs_export(bool *needs);
+
 // Validate and apply JSON text (upload / shared import path).
 int app_config_import_text(const char *text, size_t len);
 

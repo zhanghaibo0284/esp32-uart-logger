@@ -80,6 +80,7 @@ void app_config_build_snapshot(char *out, size_t out_len)
     cJSON_AddStringToObject(root, "magic", CFG_MAGIC_TEXT);
     cJSON_AddNumberToObject(root, "version", CFG_VERSION);
     cJSON_AddNumberToObject(root, "segment_min", settings.segment_min);
+    cJSON_AddBoolToObject(root, "screen_auto_off", settings.screen_auto_off);
 
     cJSON *ports = cJSON_AddArrayToObject(root, "ports");
     for (int i = 0; i < APP_PORT_COUNT; i++) {
@@ -188,6 +189,7 @@ int app_config_import_text(const char *text, size_t len)
         cJSON *magic = cJSON_GetObjectItem(root, "magic");
         cJSON *version = cJSON_GetObjectItem(root, "version");
         cJSON *seg = cJSON_GetObjectItem(root, "segment_min");
+        cJSON *autooff = cJSON_GetObjectItem(root, "screen_auto_off");
         cJSON *ports = cJSON_GetObjectItem(root, "ports");
         cJSON *wifi_j = cJSON_GetObjectItem(root, "wifi");
         cJSON *br = cJSON_GetObjectItem(root, "bridge");
@@ -202,6 +204,12 @@ int app_config_import_text(const char *text, size_t len)
             break;
         }
         settings.segment_min = (uint16_t)seg->valueint;
+        // Missing flag accepted and treated as enabled; present must be bool.
+        settings.screen_auto_off = autooff ? cJSON_IsTrue(autooff) : true;
+        if (autooff && !cJSON_IsBool(autooff)) {
+            err = "screen_auto_off 必须为布尔";
+            break;
+        }
 
         if (!ports || !cJSON_IsArray(ports) || cJSON_GetArraySize(ports) != APP_PORT_COUNT) {
             err = "ports字段无效";
@@ -324,6 +332,31 @@ static int read_file(const char *path, char *buf, size_t buf_len)
     }
     app_fs_unlock();
     return rc;
+}
+
+int app_config_needs_export(bool *needs)
+{
+    if (!needs) {
+        return -1;
+    }
+    *needs = false;
+    if (!app_sd_is_mounted()) {
+        return 0;
+    }
+    char *snap = cfg_malloc(2048);
+    char *file = cfg_malloc(APP_CONFIG_FILE_BYTES);
+    if (!snap || !file) {
+        cfg_free(snap);
+        cfg_free(file);
+        return -1;
+    }
+    app_config_build_snapshot(snap, 2048);
+    int n = read_file(CFG_PATH, file, APP_CONFIG_FILE_BYTES);
+    // Missing file or any mismatch with the canonical snapshot -> export.
+    *needs = n < 0 || strcmp(snap, file) != 0;
+    cfg_free(snap);
+    cfg_free(file);
+    return 0;
 }
 
 static void backup_existing(void)
