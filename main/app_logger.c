@@ -16,26 +16,30 @@
 #include "app_sd.h"
 #include "app_time.h"
 #include "app_bridge.h"
+#include "app_config.h"
+#include "app_modbus.h"
 #include "led.h"
 
 static const char *TAG = "logger";
-#define LINE_BYTES 16
-#define IDLE_GAP_US 40000
+
+#define FRAME_BYTES 520         // RTU max 256; ASCII ':' + 512 chars + CRLF
+#define TXQ_DEPTH   2
+#define SNAP_BYTES  2048
 
 typedef struct {
-    uint8_t raw[LINE_BYTES];
+    uint8_t *raw;               // allocated in PSRAM (large)
     int count;
     struct timeval first;
     int64_t last_us;
     bool active;
-} line_builder_t;
+} frame_builder_t;
 
 typedef struct {
-    bool pending;
+    bool used;
     int port;
-    uint8_t data[32];
+    uint8_t data[FRAME_BYTES];
     int len;
-} inject_req_t;
+} tx_req_t;
 
 static SemaphoreHandle_t s_lock;
 static app_view_t s_view;
@@ -45,7 +49,6 @@ static bool s_reload;
 static bool s_remount;
 static bool s_sd_test;
 static bool s_tx_test[APP_PORT_COUNT];
-static inject_req_t s_inject;
 static bool s_repeat_on[APP_PORT_COUNT];
 static uint32_t s_repeat_ms[APP_PORT_COUNT] = {1000, 1000, 1000};
 static int64_t s_repeat_next_us[APP_PORT_COUNT];
@@ -53,11 +56,21 @@ static uint32_t s_repeat_seq[APP_PORT_COUNT];
 static bool s_uart_on[APP_PORT_COUNT];
 static FILE *s_fp[APP_PORT_COUNT];
 static time_t s_file_start[APP_PORT_COUNT];
-static line_builder_t s_builder[APP_PORT_COUNT];
+static frame_builder_t s_builder[APP_PORT_COUNT];
+static int64_t s_prev_poll_us[APP_PORT_COUNT];
+static tx_req_t s_txq[TXQ_DEPTH];
 static bool s_dirty;
+
 #define LIVE_CAP 4096
 static char s_live[APP_PORT_COUNT][LIVE_CAP];
 static uint32_t s_live_end[APP_PORT_COUNT];
+
+static char s_sd_msg[48] = "等待SD卡";
+
+// --- config change detection ------------------------------------------------
+static char *s_last_snap;       // PSRAM
+static bool s_snap_inited;
+static int64_t last_cfg_check_us = -2000000;
 
 static void live_append(int index, const char *text)
 {
@@ -75,7 +88,6 @@ static void live_append(int index, const char *text)
     }
     xSemaphoreGive(s_lock);
 }
-static char s_sd_msg[48] = "等待SD卡";
 
 static void copy_msg(char *dst, size_t n, const char *src)
 {
@@ -185,6 +197,7 @@ static void apply_settings(void)
         close_file(i);
         s_builder[i].active = false;
         s_builder[i].count = 0;
+        app_modbus_reset(i);
         int err = 0;
         if (cfg.port[i].enabled) {
             err = open_uart(i);
@@ -255,6 +268,7 @@ static bool ensure_file(int index, time_t now)
         strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
         fprintf(fp, "# UART%d TX=%d RX=%d %s\n", index, app_uart_tx(index), app_uart_rx(index), param);
         fprintf(fp, "# segment %s\n", stamp);
+        fprintf(fp, "# format: YYYY-mm-dd HH:MM:SS.mmm TX|RX[-REQ|-RSP] HEX ; # MB-* annotation\n");
     }
     s_fp[index] = fp;
     s_file_start[index] = start;
@@ -265,99 +279,169 @@ static bool ensure_file(int index, time_t now)
     return true;
 }
 
-static void remember_hex(int index, const char *line)
+static void remember_frame(int index, const uint8_t *data, int len)
 {
-    const char *hex = strchr(line, ':');
-    if (hex) {
-        hex++;
-        while (*hex == ' ') {
-            hex++;
-        }
-    } else {
-        hex = line;
-    }
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    snprintf(s_view.last_hex, sizeof(s_view.last_hex), "U%d %s", index, hex);
-    char *nl = strchr(s_view.last_hex, '\n');
-    if (nl) {
-        *nl = '\0';
+    int used = snprintf(s_view.last_hex, sizeof(s_view.last_hex), "U%d", index);
+    for (int i = 0; i < len && used > 0 && used < (int)sizeof(s_view.last_hex) - 4; i++) {
+        used += snprintf(s_view.last_hex + used, sizeof(s_view.last_hex) - (size_t)used, " %02X", data[i]);
     }
     s_view.last_port = index;
     xSemaphoreGive(s_lock);
 }
 
-static void write_record(int index, const struct timeval *tv, const uint8_t *data, int len)
+// One complete frame: marker + HEX line (+ Modbus annotation).
+static void write_frame(int index, const struct timeval *tv,
+                        const uint8_t *data, int len, bool own_tx)
 {
-    app_fs_lock();
-    char line[160];
+    if (len <= 0) {
+        return;
+    }
+
+    mb_info_t mb;
+    char note[192];
+    note[0] = '\0';
+    app_modbus_frame(index, data, len, own_tx, &mb, note, sizeof(note));
+
+    const char *marker;
+    if (own_tx) {
+        marker = (mb.parsed && mb.role == MB_ROLE_REQ) ? "TX-REQ" : "TX";
+    } else if (!mb.parsed) {
+        marker = "RX";
+    } else if (mb.role == MB_ROLE_REQ) {
+        marker = "RX-REQ";
+    } else if (mb.role == MB_ROLE_RSP) {
+        marker = "RX-RSP";
+    } else {
+        marker = "RX";
+    }
+
+    char line[1600];
     struct tm tm;
     localtime_r(&tv->tv_sec, &tm);
-    int used = snprintf(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d.%03ld: ",
+    int used = snprintf(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d.%03ld %s ",
                         tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                        tm.tm_hour, tm.tm_min, tm.tm_sec, tv->tv_usec / 1000);
+                        tm.tm_hour, tm.tm_min, tm.tm_sec, tv->tv_usec / 1000, marker);
     for (int i = 0; i < len && used > 0 && used < (int)sizeof(line) - 4; i++) {
-        used += snprintf(line + used, sizeof(line) - (size_t)used, "%02X%s", data[i], (i + 1 == len) ? "" : " ");
+        used += snprintf(line + used, sizeof(line) - (size_t)used, "%02X%s",
+                         data[i], (i + 1 == len) ? "" : " ");
     }
     if (used > 0 && used < (int)sizeof(line) - 2) {
         line[used++] = '\n';
         line[used] = '\0';
     }
-    remember_hex(index, line);
+
+    remember_frame(index, data, len);
     {
         const char *tag = index == 1 ? "J2" : index == 2 ? "J3" : "U0";
-        char tagged[180];
-        snprintf(tagged, sizeof(tagged), "RX %s %s", tag, line);
+        char tagged[1640];
+        snprintf(tagged, sizeof(tagged), "%s %s", tag, line);
         live_append(index, tagged);
+        if (note[0]) {
+            char noted[220];
+            snprintf(noted, sizeof(noted), "%s %s\n", tag, note);
+            live_append(index, noted);
+        }
     }
 
     if (!ensure_file(index, tv->tv_sec)) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_view.port[index].drop_lines++;
         xSemaphoreGive(s_lock);
-        app_fs_unlock();
         return;
     }
-    size_t wrote = fwrite(line, 1, strlen(line), s_fp[index]);
-    if (wrote != strlen(line)) {
+
+    app_fs_lock();
+    size_t need = strlen(line);
+    bool ok = fwrite(line, 1, need, s_fp[index]) == need;
+    if (ok && note[0]) {
+        size_t nlen = strlen(note);
+        ok = fwrite(note, 1, nlen, s_fp[index]) == nlen;
+        if (ok) {
+            ok = fputc('\n', s_fp[index]) == '\n';
+        }
+    }
+    app_fs_unlock();
+
+    if (ok) {
+        s_dirty = true;
+    } else {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_view.port[index].drop_lines++;
         xSemaphoreGive(s_lock);
-        app_fs_unlock();
-        return;
     }
-    s_dirty = true;
-    app_fs_unlock();
 }
 
-static void flush_builder(int index)
+static void flush_frame(int index)
 {
-    line_builder_t *builder = &s_builder[index];
+    frame_builder_t *builder = &s_builder[index];
     if (!builder->active || builder->count <= 0) {
         builder->active = false;
         builder->count = 0;
         return;
     }
-    write_record(index, &builder->first, builder->raw, builder->count);
+    write_frame(index, &builder->first, builder->raw, builder->count, false);
     builder->active = false;
     builder->count = 0;
 }
 
+// Inter-frame silence: Modbus RTU 3.5 char times (>=19200 baud fixed 1.75ms).
+static int frame_gap_us(int index)
+{
+    uint32_t baud = s_port_cfg[index].baud ? s_port_cfg[index].baud : 115200;
+    int64_t us = (11LL * 35 * 100000) / (int64_t)baud;
+    if (us < 1750) {
+        us = 1750;
+    }
+    return (int)us;
+}
+
+// Duration of one byte on the wire: start + 8 data + parity(if used) + stop.
+static int64_t byte_time_us(int index)
+{
+    uint32_t baud = s_port_cfg[index].baud ? s_port_cfg[index].baud : 115200;
+    int bits = s_port_cfg[index].parity == UART_PARITY_DISABLE ? 10 : 11;
+    return (int64_t)bits * 1000000 / (int64_t)baud;
+}
+
 static void push_bytes(int index, const uint8_t *data, int len, int64_t now_us)
 {
-    line_builder_t *builder = &s_builder[index];
+    frame_builder_t *builder = &s_builder[index];
+    bool ascii_mode = builder->active && builder->raw[0] == ':';
+
+    // Bytes arrived only during this poll window. Estimate the bus silence
+    // before this chunk as (window length - time to send len bytes); this keeps
+    // one frame intact across consecutive polls without per-byte timestamps.
+    if (len > 0 && builder->active) {
+        int64_t window = now_us - s_prev_poll_us[index];
+        int64_t data_time = (int64_t)len * byte_time_us(index);
+        int64_t silence = window > data_time ? window - data_time : 0;
+        if ((data[0] == ':') ||
+            (ascii_mode && data[0] == '\n') ||
+            (!ascii_mode && silence >= frame_gap_us(index))) {
+            flush_frame(index);
+            ascii_mode = false;
+        }
+    }
+
     for (int i = 0; i < len; i++) {
-        if (builder->active && now_us - builder->last_us > IDLE_GAP_US) {
-            flush_builder(index);
+        uint8_t ch = data[i];
+
+        if (builder->active && ch == ':' && i > 0) {
+            // New ASCII frame beginning inside a chunk: finish the previous one.
+            flush_frame(index);
+            ascii_mode = true;
         }
         if (!builder->active) {
             gettimeofday(&builder->first, NULL);
             builder->active = true;
             builder->count = 0;
+            ascii_mode = ch == ':';
         }
-        builder->raw[builder->count++] = data[i];
+        builder->raw[builder->count++] = ch;
         builder->last_us = now_us;
-        if (builder->count >= LINE_BYTES) {
-            flush_builder(index);
+        if (builder->count >= FRAME_BYTES) {
+            flush_frame(index);
         }
     }
     app_bridge_feed_uart(index, data, (size_t)len);
@@ -421,7 +505,7 @@ static void run_sd_test(void)
     publish_sd();
 }
 
-static void take_requests(bool *reload, bool *remount, bool *sd_test, bool tx_test[APP_PORT_COUNT], inject_req_t *inject)
+static void take_requests(bool *reload, bool *remount, bool *sd_test, bool tx_test[APP_PORT_COUNT])
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     *reload = s_reload;
@@ -434,9 +518,48 @@ static void take_requests(bool *reload, bool *remount, bool *sd_test, bool tx_te
         tx_test[i] = s_tx_test[i];
         s_tx_test[i] = false;
     }
-    *inject = s_inject;
-    s_inject.pending = false;
     xSemaphoreGive(s_lock);
+}
+
+// Transmit one queued outbound frame in the logger context, then record it.
+static void execute_tx(int port, const uint8_t *data, int len)
+{
+    flush_frame(port);
+    int wrote = uart_write_bytes((uart_port_t)port, data, len);
+    if (wrote > 0) {
+        uart_wait_tx_done((uart_port_t)port, pdMS_TO_TICKS(100));
+        // Discard loopback echo so it is not logged a second time.
+        uint8_t echo[FRAME_BYTES];
+        uart_read_bytes((uart_port_t)port, echo, sizeof(echo), pdMS_TO_TICKS(5));
+    }
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    write_frame(port, &tv, data, wrote > 0 ? wrote : 0, true);
+
+    if (wrote > 0) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_view.port[port].tx_bytes += (uint32_t)wrote;
+        s_view.port[port].tx_frames++;
+        xSemaphoreGive(s_lock);
+    }
+}
+
+static void drain_txq(void)
+{
+    for (int d = 0; d < TXQ_DEPTH; d++) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        tx_req_t req = s_txq[d];
+        if (req.used) {
+            s_txq[d].used = false;
+        }
+        xSemaphoreGive(s_lock);
+        if (req.used) {
+            if (req.port >= 0 && req.port < APP_PORT_COUNT && s_uart_on[req.port]) {
+                execute_tx(req.port, req.data, req.len);
+            }
+        }
+    }
 }
 
 static void send_one_periodic(int port, int64_t now_us)
@@ -453,45 +576,15 @@ static void send_one_periodic(int port, int64_t now_us)
         return;
     }
     s_repeat_next_us[port] = now_us + (int64_t)interval_ms * 1000;
-    const char *tag = port == 1 ? "J2" : port == 2 ? "J3" : "U0";
-    char line[28];
-    int len = snprintf(line, sizeof(line), "%s 55AA %04lu\r\n", tag, (unsigned long)(seq % 10000));
-    if (len <= 0) {
-        return;
+    char line[40];
+    int len = snprintf(line, sizeof(line), "P%u %04lu\r\n", port, (unsigned long)(seq % 10000));
+    if (len > 0) {
+        execute_tx(port, (const uint8_t *)line, len);
     }
-    int wrote = uart_write_bytes((uart_port_t)port, line, len);
-    if (wrote <= 0) {
-        return;
-    }
-    uart_wait_tx_done((uart_port_t)port, pdMS_TO_TICKS(40));
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_repeat_seq[port] = seq + 1;
-    s_view.port[port].tx_bytes += (uint32_t)wrote;
-    s_view.port[port].tx_frames++;
     s_view.port[port].sending = true;
     xSemaphoreGive(s_lock);
-    {
-        char note[40];
-        int k = 0;
-        note[k++] = 'T';
-        note[k++] = 'X';
-        note[k++] = ' ';
-        for (int i = 0; line[i] && k + 2 < (int)sizeof(note); i++) {
-            if (line[i] != '\r') {
-                note[k++] = line[i];
-            }
-        }
-        if (k == 0 || note[k - 1] != '\n') {
-            note[k++] = '\n';
-        }
-        note[k] = '\0';
-        live_append(port, note);
-    }
-    uint8_t echo[64];
-    int got = uart_read_bytes((uart_port_t)port, echo, sizeof(echo), pdMS_TO_TICKS(5));
-    if (got > 0) {
-        push_bytes(port, echo, got, now_us);
-    }
 }
 
 static void send_periodic(int64_t now_us)
@@ -499,6 +592,45 @@ static void send_periodic(int64_t now_us)
     for (int port = 0; port < APP_PORT_COUNT; port++) {
         send_one_periodic(port, now_us);
     }
+}
+
+static void check_config_changes(int64_t now_us)
+{
+    if (now_us - last_cfg_check_us < 2000000) {
+        return;
+    }
+    last_cfg_check_us = now_us;
+
+    char *cur = heap_caps_malloc(SNAP_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!cur) {
+        return;
+    }
+    app_config_build_snapshot(cur, SNAP_BYTES);
+
+    if (!s_snap_inited) {
+        s_snap_inited = true;
+        snprintf(s_last_snap, SNAP_BYTES, "%s", cur);
+        app_config_status_t st;
+        app_config_get_status(&st);
+        if (app_sd_is_mounted() && !st.present) {
+            app_config_export();
+        }
+        free(cur);
+        return;
+    }
+
+    if (strcmp(cur, s_last_snap) != 0) {
+        if (app_config_export() == 0) {
+            snprintf(s_last_snap, SNAP_BYTES, "%s", cur);
+        }
+    } else {
+        app_config_status_t st;
+        app_config_get_status(&st);
+        if (app_sd_is_mounted() && !st.present) {
+            app_config_export();
+        }
+    }
+    free(cur);
 }
 
 static void logger_task(void *arg)
@@ -516,8 +648,7 @@ static void logger_task(void *arg)
         bool remount = false;
         bool sd_test = false;
         bool tx_test[APP_PORT_COUNT] = {0};
-        inject_req_t inject = {0};
-        take_requests(&reload, &remount, &sd_test, tx_test, &inject);
+        take_requests(&reload, &remount, &sd_test, tx_test);
 
         int64_t now_us = esp_timer_get_time();
         if (remount || (!app_sd_is_mounted() && now_us - last_sd_try_us > 8000000)) {
@@ -538,21 +669,18 @@ static void logger_task(void *arg)
         if (sd_test) {
             run_sd_test();
         }
-        if (inject.pending && inject.port >= 0 && inject.port < APP_PORT_COUNT && inject.len > 0) {
-            struct timeval tv;
-            gettimeofday(&tv, NULL);
-            write_record(inject.port, &tv, inject.data, inject.len);
-        }
+        drain_txq();
         for (int i = 0; i < APP_PORT_COUNT; i++) {
             if (!tx_test[i] || !s_uart_on[i]) {
                 continue;
             }
             const uint8_t probe[] = {0x55, 0xAA, 0x01, 0x02, 0x03};
-            uart_write_bytes((uart_port_t)i, probe, sizeof(probe));
+            execute_tx(i, probe, sizeof(probe));
         }
 
         send_periodic(now_us);
 
+        bool activity = false;
         for (int i = 0; i < APP_PORT_COUNT; i++) {
             if (!s_uart_on[i]) {
                 continue;
@@ -560,15 +688,21 @@ static void logger_task(void *arg)
             int n = uart_read_bytes((uart_port_t)i, buf, sizeof(buf), 0);
             if (n > 0) {
                 push_bytes(i, buf, n, now_us);
-            } else if (s_builder[i].active && now_us - s_builder[i].last_us > IDLE_GAP_US) {
-                flush_builder(i);
+                activity = true;
+            } else if (s_builder[i].active && now_us - s_builder[i].last_us > frame_gap_us(i)) {
+                flush_frame(i);
             }
+            if (s_builder[i].active) {
+                activity = true;
+            }
+            s_prev_poll_us[i] = now_us;
         }
 
         if (s_dirty && now_us - last_sync_us > 2000000) {
             sync_files();
             last_sync_us = now_us;
         }
+        check_config_changes(now_us);
         if (now_us - last_usage_us > 30000000) {
             app_sd_refresh_usage();
             publish_sd();
@@ -578,13 +712,24 @@ static void logger_task(void *arg)
             app_time_persist_now();
             last_time_save_us = now_us;
         }
-        vTaskDelay(pdMS_TO_TICKS(8));
+        // Fast 1ms polling during traffic keeps frame timing accurate;
+        // fall back to 8ms only when every port is idle.
+        vTaskDelay(pdMS_TO_TICKS(activity ? 1 : 8));
     }
 }
 
 void app_logger_start(void)
 {
     s_lock = xSemaphoreCreateMutex();
+
+    // Large buffers live in PSRAM so the internal heap stays intact.
+    s_last_snap = heap_caps_malloc(SNAP_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int64_t t0 = esp_timer_get_time();
+    for (int i = 0; i < APP_PORT_COUNT; i++) {
+        s_builder[i].raw = heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_prev_poll_us[i] = t0;
+    }
+
     copy_msg(s_sd_msg, sizeof(s_sd_msg), app_sd_is_mounted() ? "SD卡正常" : "无卡");
     publish_sd();
     xTaskCreatePinnedToCore(logger_task, "logger", 8192, NULL, 8, NULL, 0);
@@ -667,20 +812,36 @@ void app_logger_stop_periodic_tx(void)
     }
 }
 
-void app_logger_inject(int port, const uint8_t *data, int len)
+bool app_logger_request_tx(int port, const uint8_t *data, int len)
 {
     if (port < 0 || port >= APP_PORT_COUNT || !data || len <= 0) {
-        return;
+        return false;
     }
-    if (len > (int)sizeof(s_inject.data)) {
-        len = (int)sizeof(s_inject.data);
+    if (len > FRAME_BYTES) {
+        len = FRAME_BYTES;
     }
+    bool queued = false;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_inject.port = port;
-    s_inject.len = len;
-    memcpy(s_inject.data, data, (size_t)len);
-    s_inject.pending = true;
+    for (int d = 0; d < TXQ_DEPTH; d++) {
+        if (!s_txq[d].used) {
+            s_txq[d].used = true;
+            s_txq[d].port = port;
+            s_txq[d].len = len;
+            memcpy(s_txq[d].data, data, (size_t)len);
+            queued = true;
+            break;
+        }
+    }
     xSemaphoreGive(s_lock);
+    return queued;
+}
+
+void app_logger_inject(int port, const uint8_t *data, int len)
+{
+    if (len > 32) {
+        len = 32;
+    }
+    app_logger_request_tx(port, data, len);
 }
 
 void app_logger_live_get(int index, uint32_t since, char *out, size_t out_len, uint32_t *next)
@@ -726,7 +887,7 @@ void app_logger_flush(void)
 void app_logger_release_files(void)
 {
     for (int i = 0; i < APP_PORT_COUNT; i++) {
-        flush_builder(i);
+        flush_frame(i);
         close_file(i);
     }
 }

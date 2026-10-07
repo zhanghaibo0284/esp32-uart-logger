@@ -13,6 +13,7 @@
 #include "esp_heap_caps.h"
 #include "nvs.h"
 #include "driver/uart.h"
+#include "app_logger.h"
 
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -78,23 +79,69 @@ static void load_nvs(void)
     s_adv_wanted = s_info.ble_on;
 }
 
+static void fill_blob(bridge_blob_t *blob, const bridge_info_t *info)
+{
+    memset(blob, 0, sizeof(*blob));
+    blob->magic = BLOB_MAGIC;
+    for (int i = 0; i < APP_PORT_COUNT; i++) {
+        blob->tcp_on[i] = info->tcp_on[i] ? 1 : 0;
+        blob->tcp_port[i] = info->tcp_port[i];
+    }
+    blob->ble_on = info->ble_on ? 1 : 0;
+    blob->ble_port = (uint8_t)info->ble_port;
+    snprintf(blob->ble_name, sizeof(blob->ble_name), "%s", info->ble_name);
+}
+
+static int write_blob(const bridge_blob_t *blob)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return -1;
+    }
+    nvs_set_blob(h, "cfg", blob, sizeof(*blob));
+    nvs_commit(h);
+    nvs_close(h);
+    return 0;
+}
+
 static void save_nvs(void)
 {
-    bridge_blob_t blob = {0};
-    blob.magic = BLOB_MAGIC;
+    bridge_blob_t blob;
+    fill_blob(&blob, &s_info);
+    write_blob(&blob);
+}
+
+static bool name_ok_persist(const char *name)
+{
+    if (!name) {
+        return false;
+    }
+    size_t n = strlen(name);
+    if (n < 1 || n > BRIDGE_NAME_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ch = (unsigned char)name[i];
+        if (ch < 0x20 || ch > 0x7e) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int app_bridge_persist(const bridge_info_t *in)
+{
+    if (!in || in->ble_port < 0 || in->ble_port >= APP_PORT_COUNT || !name_ok_persist(in->ble_name)) {
+        return -1;
+    }
     for (int i = 0; i < APP_PORT_COUNT; i++) {
-        blob.tcp_on[i] = s_info.tcp_on[i] ? 1 : 0;
-        blob.tcp_port[i] = s_info.tcp_port[i];
+        if (in->tcp_port[i] < 1024) {
+            return -1;
+        }
     }
-    blob.ble_on = s_info.ble_on ? 1 : 0;
-    blob.ble_port = (uint8_t)s_info.ble_port;
-    snprintf(blob.ble_name, sizeof(blob.ble_name), "%s", s_info.ble_name);
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_blob(h, "cfg", &blob, sizeof(blob));
-        nvs_commit(h);
-        nvs_close(h);
-    }
+    bridge_blob_t blob;
+    fill_blob(&blob, in);
+    return write_blob(&blob);
 }
 
 static int tcp_listen_start(int idx)
@@ -139,6 +186,8 @@ static void bridge_task(void *arg)
 {
     uint8_t buf[256];
     while (1) {
+        int txport = -1;
+        int txlen = 0;
         xSemaphoreTake(s_lock, portMAX_DELAY);
         for (int i = 0; i < APP_PORT_COUNT; i++) {
             if (s_listen_fd[i] < 0) {
@@ -157,7 +206,9 @@ static void bridge_task(void *arg)
             if (cfd >= 0) {
                 int n = recv(cfd, buf, sizeof(buf), MSG_DONTWAIT);
                 if (n > 0) {
-                    uart_write_bytes((uart_port_t)i, buf, n);
+                    // Hand off to the logger (TX record + actual write).
+                    txport = i;
+                    txlen = n;
                     s_info.tcp_rx[i] += n;
                 } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
                     tcp_drop_client(i);
@@ -165,6 +216,9 @@ static void bridge_task(void *arg)
             }
         }
         xSemaphoreGive(s_lock);
+        if (txlen > 0 && !app_logger_request_tx(txport, buf, txlen)) {
+            ESP_LOGW(TAG, "tx queue full, %d bytes dropped", txlen);
+        }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -226,7 +280,9 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         int port = s_info.ble_port;
         s_info.ble_rx += copied;
         xSemaphoreGive(s_lock);
-        uart_write_bytes((uart_port_t)port, tmp, copied);
+        if (!app_logger_request_tx(port, tmp, copied)) {
+            ESP_LOGW(TAG, "tx queue full, ble write dropped");
+        }
     }
     return 0;
 }
@@ -437,6 +493,20 @@ int app_bridge_ble_set(bool on, int port_idx, const char *name)
 
 void app_bridge_get(bridge_info_t *out)
 {
+    if (!out) {
+        return;
+    }
+    if (!s_lock) {
+        // Called before app_bridge_ble_init: return defaults (same as load_nvs).
+        memset(out, 0, sizeof(*out));
+        for (int i = 0; i < APP_PORT_COUNT; i++) {
+            out->tcp_port[i] = (uint16_t)(8081 + i);
+            out->tcp_clients[i] = -1;
+        }
+        out->ble_port = 1;
+        snprintf(out->ble_name, sizeof(out->ble_name), "UART-LOG-BLE");
+        return;
+    }
     xSemaphoreTake(s_lock, portMAX_DELAY);
     *out = s_info;
     xSemaphoreGive(s_lock);

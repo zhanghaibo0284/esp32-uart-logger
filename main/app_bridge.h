@@ -24,6 +24,9 @@ typedef struct {
 void app_bridge_ble_init(void);
 void app_bridge_tcp_resume(void);
 void app_bridge_get(bridge_info_t *out);
+
+// Validate and persist bridge settings to NVS only (no listener/stack change).
+int app_bridge_persist(const bridge_info_t *in);
 int app_bridge_tcp_set(int port_idx, bool on, uint16_t port_num);
 int app_bridge_ble_set(bool on, int port_idx, const char *name);
 void app_bridge_feed_uart(int port_idx, const uint8_t *data, size_t len);

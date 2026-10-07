@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "app_logger.h"
 #include "app_settings.h"
+#include "app_config.h"
 #include "app_time.h"
 
 static const char *TAG = "cmd";
@@ -205,6 +206,45 @@ static int cmd_tx(int argc, char **argv)
     return 0;
 }
 
+static int cmd_cfg(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage: cfg <save|load|restore|status>\n");
+        return 1;
+    }
+    if (!strcmp(argv[1], "save")) {
+        int rc = app_config_export();
+        printf("export rc=%d\n", rc);
+        return rc == 0 ? 0 : 1;
+    }
+    if (!strcmp(argv[1], "load")) {
+        int rc = app_config_load();
+        printf("load rc=%d\n", rc);
+        if (rc == 0) {
+            app_logger_request_reload();
+        }
+        return rc == 0 ? 0 : 1;
+    }
+    if (!strcmp(argv[1], "restore")) {
+        int rc = app_config_restore_backup();
+        printf("restore rc=%d\n", rc);
+        if (rc == 0) {
+            app_logger_request_reload();
+        }
+        return rc == 0 ? 0 : 1;
+    }
+    if (!strcmp(argv[1], "status")) {
+        app_config_status_t st;
+        app_config_get_status(&st);
+        printf("config present=%d backup=%d last_ok=%d msg=%s\n",
+               st.present ? 1 : 0, st.backup_present ? 1 : 0,
+               st.last_ok ? 1 : 0, st.msg);
+        return 0;
+    }
+    printf("usage: cfg <save|load|restore|status>\n");
+    return 1;
+}
+
 static void register_cmd(const char *name, const char *help, esp_console_cmd_func_t func)
 {
     const esp_console_cmd_t cmd = {
@@ -233,6 +273,7 @@ void app_cmd_start(void)
     register_cmd("remount", "remount SD card", cmd_remount);
     register_cmd("inject", "inject <0-2> <hex...>", cmd_inject);
     register_cmd("tx", "tx <0-2> send 55 AA 01 02 03", cmd_tx);
+    register_cmd("cfg", "cfg <save|load|restore|status>", cmd_cfg);
     ESP_ERROR_CHECK(esp_console_register_help_command());
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     ESP_LOGI(TAG, "console ready");

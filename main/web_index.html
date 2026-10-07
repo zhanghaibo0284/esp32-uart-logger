@@ -22,6 +22,7 @@ button{background:#2f6fed;color:#fff;border:0;border-radius:8px;padding:12px 14p
 #crumb a{color:#8ec5ff;margin-right:4px}
 .msg{min-height:1.2em;color:#ffd27a}
 #live{height:240px;overflow:auto;background:#0b0f14;padding:8px;white-space:pre-wrap;font:13px/1.35 ui-monospace,monospace}
+#cfg-file{width:auto;padding:0;background:none;border-radius:0}
 </style>
 </head>
 <body>
@@ -71,6 +72,20 @@ button{background:#2f6fed;color:#fff;border:0;border-radius:8px;padding:12px 14p
 <button type="button" id="btn-zipall">下载全部</button>
 <div id="files"></div>
 <div id="file-msg" class="msg"></div>
+</div>
+<div class="card">
+<h2>配置管理</h2>
+<div class="muted">config.json 位于TF卡根目录：屏幕或本页修改参数都会自动写入，每次覆盖自动备份 config.json.bak。WiFi名称/密码与透传开关经文件加载后在下次启动生效。</div>
+<div class="row">
+<button type="button" id="cfg-download">下载config.json</button>
+<button type="button" id="cfg-export">立即导出</button>
+<button type="button" id="cfg-reload">从卡重载</button>
+<button type="button" id="cfg-restore">恢复备份</button>
+</div>
+<div class="row">
+<label>上传config.json <input id="cfg-file" type="file" accept=".json,application/json"></label>
+</div>
+<div id="cfg-msg" class="msg"></div>
 </div>
 </main>
 <script>
@@ -402,6 +417,35 @@ function renderBridge(){
 }
 
 setInterval(renderBridge, 3000);
+
+// --- configuration management ---
+function cfgMsg(text){ show('cfg-msg', text); }
+document.getElementById('cfg-download').onclick = function(){
+  window.location.href='/dl?path='+encodeURIComponent('/sdcard/config.json');
+};
+function cfgOp(op, done){
+  cfgMsg('请稍候');
+  apiGet('/api/config?op='+op).then(function(r){
+    cfgMsg(r.ok ? (r.msg||'完成') : (r.err||'失败'));
+    if(r.ok) { loadStatus(true); }
+    if(done) done(r);
+  }).catch(function(){ cfgMsg('无响应'); });
+}
+document.getElementById('cfg-export').onclick = function(){ cfgOp('export'); };
+document.getElementById('cfg-reload').onclick = function(){ cfgOp('reload'); };
+document.getElementById('cfg-restore').onclick = function(){ cfgOp('restore'); };
+document.getElementById('cfg-file').addEventListener('change', function(ev){
+  var f = ev.target.files[0];
+  if(!f) return;
+  if(f.size > 8000){ cfgMsg('文件需小于8KB'); return; }
+  cfgMsg('请稍候');
+  f.text().then(function(t){
+    return fetch('/api/config_upload', {method:'POST', body:t});
+  }).then(function(r){ return r.json(); }).then(function(r){
+    cfgMsg(r.ok ? '上传并加载成功' : (r.err||'失败'));
+    if(r.ok){ loadStatus(true); }
+  }).catch(function(){ cfgMsg('上传失败'); });
+});
 </script>
 </body>
 </html>

@@ -9,6 +9,7 @@
 #include "app_time.h"
 #include "app_sd.h"
 #include "app_logger.h"
+#include "app_config.h"
 #include "app_cmd.h"
 #include "app_ui.h"
 #include "app_wifi.h"
@@ -49,6 +50,16 @@ void app_main(void)
 
     if (app_sd_mount() != ESP_OK) {
         ESP_LOGW(TAG, "SD card not ready");
+    }
+    app_config_init();
+    int cfg_rc = app_config_load();
+    if (cfg_rc == 0) {
+        ESP_LOGI(TAG, "config.json loaded");
+    } else if (cfg_rc == 1) {
+        ESP_LOGI(TAG, "config.json absent, will create on first export");
+    } else {
+        ESP_LOGW(TAG, "config.json invalid, repairing from current settings");
+        app_config_export();
     }
     app_logger_start();
     BaseType_t ui_ret = xTaskCreatePinnedToCore(ui_task, "ui", 16384, NULL, 4, NULL, 1);

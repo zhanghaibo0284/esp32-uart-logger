@@ -60,16 +60,25 @@ static void load_saved(char *ssid, char *pass)
     }
 }
 
-static void save_nvs(const char *ssid, const char *pass)
+static int save_nvs(const char *ssid, const char *pass)
 {
     nvs_handle_t handle;
     if (nvs_open(NVS_NS, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+        return -1;
     }
     nvs_set_str(handle, "ap_ssid", ssid);
     nvs_set_str(handle, "ap_pass", pass);
     nvs_commit(handle);
     nvs_close(handle);
+    return 0;
+}
+
+int app_wifi_persist(const char *ssid, const char *pass)
+{
+    if (!ascii_token(ssid, 1, APP_WIFI_SSID_LEN) || !ascii_token(pass, 8, APP_WIFI_PASS_LEN)) {
+        return -1;
+    }
+    return save_nvs(ssid, pass);
 }
 
 static void publish(bool up, const char *ssid, const char *pass, const char *ip)

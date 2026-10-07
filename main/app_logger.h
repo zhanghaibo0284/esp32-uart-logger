@@ -35,6 +35,10 @@ void app_logger_set_periodic_tx(int port, uint32_t interval_ms);
 void app_logger_stop_periodic_tx(void);
 void app_logger_stop_periodic_tx_port(int port);
 void app_logger_inject(int port, const uint8_t *data, int len);
+
+// Queue data for transmission on a port; it is sent by the logger task and
+// recorded as a TX frame. Returns false when the outbound queue is full.
+bool app_logger_request_tx(int port, const uint8_t *data, int len);
 void app_logger_live_get(int index, uint32_t since, char *out, size_t out_len, uint32_t *next);
 void app_logger_flush(void);
 void app_logger_release_files(void);
