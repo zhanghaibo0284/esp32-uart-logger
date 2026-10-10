@@ -102,15 +102,19 @@ static void format_size(char *out, size_t out_len, uint32_t bytes)
     }
 }
 
+static bool vcomes_before(uint8_t dir_a, const char *name_a,
+                         uint8_t dir_b, const char *name_b)
+{
+    if (dir_a != dir_b) {
+        return dir_a > dir_b;          // directories first
+    }
+    int c = strcmp(name_a, name_b);
+    return dir_a ? c < 0 : c > 0;      // dirs asc, files desc (newest first)
+}
+
 static bool comes_before(int a, int b)
 {
-    if (s_is_dir[a] != s_is_dir[b]) {
-        return s_is_dir[a] > s_is_dir[b];
-    }
-    if (s_is_dir[a]) {
-        return strcmp(s_names[a], s_names[b]) < 0;
-    }
-    return strcmp(s_names[a], s_names[b]) > 0;
+    return vcomes_before(s_is_dir[a], s_names[a], s_is_dir[b], s_names[b]);
 }
 
 static int load_dir(void)
@@ -133,32 +137,51 @@ static int load_dir(void)
         if (ent->d_name[0] == '.') {
             continue;
         }
-        if (strlen(ent->d_name) >= NAME_LEN) {
+        size_t name_len = strlen(ent->d_name);
+        if (name_len >= NAME_LEN) {
             continue;
         }
-        if (s_count >= FILE_LIST_MAX) {
-            s_truncated = true;
-            break;
-        }
-        char child[160];
-        if (!join_path(child, sizeof(child), s_dir, ent->d_name)) {
-            continue;
-        }
-        struct stat st;
+        // Type comes from d_type (FATFS VFS fills it); fall back to stat only
+        // when the FS did not report it. Sizes are fetched later, for the
+        // final list, so a directory with thousands of old files stays cheap.
         uint8_t is_dir = 0;
-        uint32_t bytes = 0;
-        if (stat(child, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) {
-                is_dir = 1;
-            } else if (st.st_size > 0) {
-                bytes = st.st_size > 0xFFFFFFFFUL ? 0xFFFFFFFFUL : (uint32_t)st.st_size;
+        if (ent->d_type == DT_DIR) {
+            is_dir = 1;
+        } else if (ent->d_type == DT_UNKNOWN) {
+            char child[160];
+            struct stat st;
+            if (join_path(child, sizeof(child), s_dir, ent->d_name) &&
+                stat(child, &st) == 0) {
+                is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
             }
         }
-        size_t name_len = strlen(ent->d_name);
-        memcpy(s_names[s_count], ent->d_name, name_len + 1);
-        s_is_dir[s_count] = is_dir;
-        s_sizes[s_count] = bytes;
-        s_count++;
+
+        int slot = s_count;
+        if (s_count >= FILE_LIST_MAX) {
+            // Capacity reached: keep only the newest FILE_LIST_MAX entries.
+            // Find the currently last-ranked (oldest) slot; the new entry
+            // replaces it only if it ranks ahead. Never break: later directory
+            // entries (FAT appends new files at the end) must be considered.
+            s_truncated = true;
+            int worst = 0;
+            for (int k = 1; k < FILE_LIST_MAX; k++) {
+                if (vcomes_before(s_is_dir[worst], s_names[worst],
+                                  s_is_dir[k], s_names[k])) {
+                    worst = k;
+                }
+            }
+            if (!vcomes_before(is_dir, ent->d_name,
+                               s_is_dir[worst], s_names[worst])) {
+                continue;   // new entry older than everything kept: discard
+            }
+            slot = worst;
+        }
+        memcpy(s_names[slot], ent->d_name, name_len + 1);
+        s_is_dir[slot] = is_dir;
+        s_sizes[slot] = 0;
+        if (s_count < FILE_LIST_MAX) {
+            s_count++;
+        }
     }
     closedir(dir);
     app_fs_unlock();
@@ -179,7 +202,22 @@ static int load_dir(void)
             }
         }
     }
-    ESP_LOGI(TAG, "dir %s count %d", s_dir, s_count);
+
+    // Fetch sizes only for the entries that survived (bounded, ≤FILE_LIST_MAX).
+    for (int i = 0; i < s_count; i++) {
+        if (s_is_dir[i]) {
+            continue;
+        }
+        char child[160];
+        struct stat st;
+        if (join_path(child, sizeof(child), s_dir, s_names[i]) &&
+            stat(child, &st) == 0 && st.st_size > 0) {
+            s_sizes[i] = st.st_size > 0xFFFFFFFFUL
+                         ? 0xFFFFFFFFUL : (uint32_t)st.st_size;
+        }
+    }
+
+    ESP_LOGI(TAG, "dir %s count %d%s", s_dir, s_count, s_truncated ? "+" : "");
     return s_count;
 }
 
