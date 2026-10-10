@@ -19,6 +19,8 @@ typedef struct {
     uint64_t ble_rx;
     uint64_t ble_tx;
     char ble_name[BRIDGE_NAME_LEN + 1];
+    uint64_t up_drop[APP_PORT_COUNT]; // uart->clients bytes dropped (ring full)
+    uint64_t down_drop[APP_PORT_COUNT]; // clients->uart bytes dropped (queue full)
 } bridge_info_t;
 
 void app_bridge_ble_init(void);

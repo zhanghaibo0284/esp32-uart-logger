@@ -42,6 +42,14 @@ void app_fs_unlock(void)
     }
 }
 
+bool app_fs_trylock(void)
+{
+    if (!s_fs_lock) {
+        s_fs_lock = xSemaphoreCreateRecursiveMutex();
+    }
+    return xSemaphoreTakeRecursive(s_fs_lock, 0) == pdTRUE;
+}
+
 static void set_error(const char *text)
 {
     snprintf(s_error, sizeof(s_error), "%s", text);

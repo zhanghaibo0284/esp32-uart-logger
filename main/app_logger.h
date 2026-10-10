@@ -12,6 +12,7 @@ typedef struct {
     char sd_msg[48];
     char last_hex[72];
     int last_port;
+    uint32_t frame_seq;   // increments once per completed frame (event token)
     struct {
         bool open;
         int error;

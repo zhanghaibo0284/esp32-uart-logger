@@ -341,9 +341,144 @@ static void make_note(const pdu_t *pdu, mb_role_t role, bool is_ascii, bool chec
 }
 
 // ---------------------------------------------------------------------------
-// Entry points
+// Raw burst scanning: CRC-valid frame boundaries via sequential grammar
 // ---------------------------------------------------------------------------
 
+// Candidate total frame lengths (incl checksum) starting with the given bytes.
+// Returns count; out[] receives candidates ordered by preference.
+static int candidates_at(const uint8_t *p, int remaining, int out[2])
+{
+    if (remaining < 4) {
+        return 0;
+    }
+    uint8_t fc = p[1];
+    int n = 0;
+
+    if (fc & 0x80) {                          // exception response: addr fc|80 code CRC
+        if (remaining >= 5) {
+            out[n++] = 5;
+        }
+        return n;
+    }
+    switch (fc) {
+    case 0x01: case 0x02: case 0x03: case 0x04:
+        // Prefer request (fixed 8B) when it fits; the variable response is
+        // also possible when p[2] is a plausible byte count.
+        if (remaining >= 8) {
+            out[n++] = 8;
+        }
+        if (remaining > 4 && (int)p[2] + 5 <= remaining && p[2] > 0) {
+            int L = p[2] + 5;
+            if (L != 8 && (fc < 3 || p[2] % 2 == 0)) {
+                out[n++] = L;
+            }
+        }
+        break;
+    case 0x05: case 0x06:
+        if (remaining >= 8) {
+            out[n++] = 8;
+        }
+        break;
+    case 0x0F: case 0x10:
+        // Prefer the write response echo (8B), then the write request.
+        if (remaining >= 8) {
+            out[n++] = 8;
+        }
+        if (remaining > 8 && (int)p[6] + 9 <= remaining) {
+            int L = p[6] + 9;
+            if (L != 8) {
+                out[n++] = L;
+            }
+        }
+        break;
+    case 0x17:
+        if (remaining > 4 && (int)p[2] + 5 <= remaining) {
+            out[n++] = p[2] + 5;
+        }
+        if (remaining > 12 && (int)p[10] + 13 <= remaining) {
+            int L = p[10] + 13;
+            bool dup = false;
+            for (int k = 0; k < n; k++) {
+                dup = dup || out[k] == L;
+            }
+            if (!dup) {
+                out[n++] = L;
+            }
+        }
+        break;
+    default:
+        break;
+    }
+    return n;
+}
+
+int app_modbus_scan(const uint8_t *data, int len, int *lens, int maxn)
+{
+    int count = 0;
+    int pos = 0;
+    while (pos < len && count < maxn) {
+        int cand[2];
+        int n = candidates_at(data + pos, len - pos, cand);
+        int accepted = 0;
+        for (int k = 0; k < n; k++) {
+            int L = cand[k];
+            if (L >= 4 && mb_crc16(data + pos, L - 2) ==
+                          (uint16_t)(data[pos + L - 2] | (data[pos + L - 1] << 8))) {
+                accepted = L;
+                break;
+            }
+        }
+        if (!accepted) {
+            break;
+        }
+        lens[count++] = pos + accepted;
+        pos += accepted;
+    }
+    return count;
+}
+
+bool app_modbus_prefix(const uint8_t *data, int len)
+{
+    if (len < 2) {
+        return false;
+    }
+    uint8_t fc = data[1];
+    int total = 0;
+
+    if (fc & 0x80) {
+        total = 5;
+    } else {
+        switch (fc) {
+        case 0x01: case 0x02: case 0x03: case 0x04:
+            // Fixed request (8B) or variable response (5+bc); prefix only when
+            // the response variant declares a frame longer than `len`.
+            if (len >= 3 && data[2] > 0 && 5 + data[2] > len) {
+                total = 5 + data[2];
+            }
+            break;
+        case 0x05: case 0x06:
+            total = 8;
+            break;
+        case 0x0F: case 0x10:
+            if (len >= 7) {
+                total = 9 + data[6];
+            } else {
+                total = 9;        // header incomplete; wait
+            }
+            break;
+        case 0x17:
+            if (len >= 11) {
+                total = 13 + data[10];
+            } else {
+                total = 13;
+            }
+            break;
+        default:
+            return false;
+        }
+    }
+    return total > len;
+}
 void app_modbus_frame(int port, const uint8_t *frame, int len, bool own_tx,
                       mb_info_t *info, char *note, size_t note_len)
 {

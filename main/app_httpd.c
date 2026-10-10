@@ -117,12 +117,15 @@ static esp_err_t bridge_status_get(httpd_req_t *req)
                      "{\"tcp\":[");
     for (int i = 0; i < APP_PORT_COUNT && n > 0; i++) {
         n += snprintf(body + n, sizeof(body) - (size_t)n,
-                      "%s{\"on\":%s,\"port\":%u,\"clients\":%d,\"rx\":%llu,\"tx\":%llu}",
+                      "%s{\"on\":%s,\"port\":%u,\"clients\":%d,\"rx\":%llu,\"tx\":%llu,"
+                      "\"updrop\":%llu,\"downdrop\":%llu}",
                       i ? "," : "",
                       info.tcp_on[i] ? "true" : "false",
                       info.tcp_port[i], info.tcp_clients[i],
                       (unsigned long long)info.tcp_rx[i],
-                      (unsigned long long)info.tcp_tx[i]);
+                      (unsigned long long)info.tcp_tx[i],
+                      (unsigned long long)info.up_drop[i],
+                      (unsigned long long)info.down_drop[i]);
     }
     n += snprintf(body + n, sizeof(body) - (size_t)n,
                   "],\"ble\":{\"on\":%s,\"connected\":%s,\"port\":%d,\"rx\":%llu,\"tx\":%llu,\"name\":\"%s\"}}",
@@ -921,8 +924,9 @@ void app_httpd_start(void)
     config.max_uri_handlers = 16;
     config.recv_wait_timeout = 10;
     config.send_wait_timeout = 20;
-    if (httpd_start(&s_server, &config) != ESP_OK) {
-        ESP_LOGE(TAG, "httpd start failed");
+    esp_err_t rc = httpd_start(&s_server, &config);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "httpd start failed: %s", esp_err_to_name(rc));
         s_server = NULL;
         return;
     }

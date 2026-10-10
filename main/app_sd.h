@@ -13,3 +13,5 @@ void app_sd_refresh_usage(void);
 const char *app_sd_last_error(void);
 void app_fs_lock(void);
 void app_fs_unlock(void);
+// Non-blocking lock attempt: true on success (pair with app_fs_unlock).
+bool app_fs_trylock(void);

@@ -21,11 +21,25 @@
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+#include "os/os_mbuf.h"
 
 static const char *TAG = "bridge";
 
 #define NVS_NS "bridge"
 #define BLOB_MAGIC 0x42524432u
+
+// Per-port uplink (UART -> TCP client / BLE central) staging ring. The logger
+// only appends bytes here; socket sends and BLE notifications run in the
+// bridge task, so a slow client can never block UART reading. Bytes form a
+// compact prefix; each consumer keeps its own cursor and skipped data is
+// reclaimed once both consumers pass it.
+#define UP_CAP 2048
+typedef struct {
+    uint8_t *buf;               // PSRAM
+    size_t len;                 // valid bytes
+    size_t tcp_pos;             // bytes handed to the TCP client
+    size_t ble_pos;             // bytes notified over BLE
+} up_ring_t;
 
 typedef struct {
     uint32_t magic;
@@ -39,6 +53,7 @@ typedef struct {
 static SemaphoreHandle_t s_lock;
 static bridge_info_t s_info;
 static int s_listen_fd[APP_PORT_COUNT];
+static up_ring_t s_up[APP_PORT_COUNT];
 
 static uint16_t s_tx_handle;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -182,12 +197,117 @@ static void tcp_listen_stop(int idx)
     }
 }
 
+// Downlink frame parked while the logger tx queue is full; retried across a
+// bounded number of cycles before being counted as dropped.
+typedef struct {
+    bool used;
+    int port;
+    uint8_t data[256];
+    int len;
+    int tries;
+} down_pending_t;
+
+// Deliver uplink staging bytes to both consumers. Called with s_lock held.
+// Each consumer keeps its own cursor; off/disconnected consumers skip their
+// backlog, and bytes passed by both are reclaimed.
+static void drain_uplink_locked(void)
+{
+    for (int i = 0; i < APP_PORT_COUNT; i++) {
+        up_ring_t *u = &s_up[i];
+        bool tcp_live = s_info.tcp_on[i] && s_info.tcp_clients[i] >= 0;
+        bool ble_live = s_info.ble_on && s_info.ble_connected &&
+                        s_info.ble_port == i && s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
+        if (!tcp_live) {
+            u->tcp_pos = u->len;
+        }
+        if (!ble_live) {
+            u->ble_pos = u->len;
+        }
+
+        if (tcp_live && u->tcp_pos < u->len) {
+            int sent = send(s_info.tcp_clients[i], u->buf + u->tcp_pos,
+                            u->len - u->tcp_pos, MSG_DONTWAIT);
+            if (sent > 0) {
+                s_info.tcp_tx[i] += sent;
+                u->tcp_pos += sent;
+            } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                tcp_drop_client(i);
+                u->tcp_pos = u->len;
+            }
+            // EAGAIN: keep bytes; retried next cycle (no silent loss).
+        }
+
+        if (ble_live && u->ble_pos < u->len) {
+            uint16_t mtu = ble_att_mtu(s_conn_handle);
+            size_t max = mtu >= 23 ? (size_t)mtu - 3 : 20;
+            size_t remaining = u->len - u->ble_pos;
+            size_t chunk = remaining > max ? max : remaining;
+            struct os_mbuf *om = ble_hs_mbuf_from_flat(u->buf + u->ble_pos, chunk);
+            if (om) {
+                int rc = ble_gatts_notify_custom(s_conn_handle, s_tx_handle, om);
+                if (rc == 0) {
+                    s_info.ble_tx += chunk;
+                    u->ble_pos += chunk;
+                } else {
+                    // Host did not take ownership; free and retry next cycle.
+                    os_mbuf_free_chain(om);
+                }
+            }
+        }
+
+        size_t done = u->tcp_pos < u->ble_pos ? u->tcp_pos : u->ble_pos;
+        if (done > 0) {
+            memmove(u->buf, u->buf + done, u->len - done);
+            u->len -= done;
+            u->tcp_pos -= done;
+            u->ble_pos -= done;
+        }
+    }
+}
+
+// Submit downlink data outside the bridge lock; park+retry if the logger
+// queue is full; permanently stuck frames are counted as drops.
+static void downlink_submit(down_pending_t *pend, int port, const uint8_t *data, int len)
+{
+    if (app_logger_request_tx(port, data, len)) {
+        pend->used = false;
+        return;
+    }
+    if (pend->used) {
+        ESP_LOGW(TAG, "downlink queue full, %d bytes dropped", pend->len);
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_info.down_drop[pend->port] += pend->len;
+        xSemaphoreGive(s_lock);
+    }
+    pend->used = true;
+    pend->port = port;
+    pend->len = len;
+    pend->tries = 0;
+    memcpy(pend->data, data, (size_t)len);
+}
+
 static void bridge_task(void *arg)
 {
     uint8_t buf[256];
+    down_pending_t pend = {0};
     while (1) {
         int txport = -1;
         int txlen = 0;
+
+        // Retry previously parked downlink data first (max 5 cycles ~25ms).
+        if (pend.used) {
+            pend.tries++;
+            if (app_logger_request_tx(pend.port, pend.data, pend.len)) {
+                pend.used = false;
+            } else if (pend.tries >= 5) {
+                ESP_LOGW(TAG, "downlink retry exhausted, %d bytes dropped", pend.len);
+                xSemaphoreTake(s_lock, portMAX_DELAY);
+                s_info.down_drop[pend.port] += pend.len;
+                xSemaphoreGive(s_lock);
+                pend.used = false;
+            }
+        }
+
         xSemaphoreTake(s_lock, portMAX_DELAY);
         for (int i = 0; i < APP_PORT_COUNT; i++) {
             if (s_listen_fd[i] < 0) {
@@ -203,7 +323,7 @@ static void bridge_task(void *arg)
                 }
             }
             int cfd = s_info.tcp_clients[i];
-            if (cfd >= 0) {
+            if (cfd >= 0 && !pend.used) {
                 int n = recv(cfd, buf, sizeof(buf), MSG_DONTWAIT);
                 if (n > 0) {
                     // Hand off to the logger (TX record + actual write).
@@ -215,11 +335,14 @@ static void bridge_task(void *arg)
                 }
             }
         }
+        drain_uplink_locked();
         xSemaphoreGive(s_lock);
-        if (txlen > 0 && !app_logger_request_tx(txport, buf, txlen)) {
-            ESP_LOGW(TAG, "tx queue full, %d bytes dropped", txlen);
+
+        if (txlen > 0) {
+            downlink_submit(&pend, txport, buf, txlen);
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        // 5ms cadence keeps uplink latency low (~200 wakes/s is cheap).
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -228,29 +351,18 @@ void app_bridge_feed_uart(int idx, const uint8_t *data, size_t len)
     if (idx < 0 || idx >= APP_PORT_COUNT || !data || len == 0 || !s_lock) {
         return;
     }
+    // Only enqueue into the staging ring: socket/BLE work runs in bridge_task,
+    // so the logger RX path never blocks on a slow client.
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (s_info.tcp_on[idx] && s_info.tcp_clients[idx] >= 0) {
-        int sent = send(s_info.tcp_clients[idx], data, len, MSG_DONTWAIT);
-        if (sent > 0) {
-            s_info.tcp_tx[idx] += sent;
-        } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            tcp_drop_client(idx);
-        }
+    up_ring_t *u = &s_up[idx];
+    size_t space = UP_CAP - u->len;
+    size_t take = len < space ? len : space;
+    if (take > 0) {
+        memcpy(u->buf + u->len, data, take);
+        u->len += take;
     }
-    if (s_info.ble_on && s_info.ble_connected && s_info.ble_port == idx &&
-        s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        uint16_t mtu = ble_att_mtu(s_conn_handle);
-        size_t max = mtu >= 23 ? mtu - 3 : 20;
-        for (size_t off = 0; off < len; off += max) {
-            size_t chunk = len - off > max ? max : len - off;
-            struct os_mbuf *om = ble_hs_mbuf_from_flat(data + off, chunk);
-            if (om) {
-                int rc = ble_gatts_notify_custom(s_conn_handle, s_tx_handle, om);
-                if (rc == 0) {
-                    s_info.ble_tx += chunk;
-                }
-            }
-        }
+    if (take < len) {
+        s_info.up_drop[idx] += len - take;
     }
     xSemaphoreGive(s_lock);
 }
@@ -269,11 +381,9 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                           struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        uint16_t raw_len = OS_MBUF_PKTLEN(ctxt->om);
         uint8_t tmp[256];
-        if (len > sizeof(tmp)) {
-            len = sizeof(tmp);
-        }
+        uint16_t len = raw_len > sizeof(tmp) ? sizeof(tmp) : raw_len;
         uint16_t copied = len;
         ble_hs_mbuf_to_flat(ctxt->om, tmp, len, &copied);
         xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -282,6 +392,9 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         xSemaphoreGive(s_lock);
         if (!app_logger_request_tx(port, tmp, copied)) {
             ESP_LOGW(TAG, "tx queue full, ble write dropped");
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_info.down_drop[port] += copied;
+            xSemaphoreGive(s_lock);
         }
     }
     return 0;
@@ -517,6 +630,9 @@ void app_bridge_ble_init(void)
     s_lock = xSemaphoreCreateMutex();
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         s_listen_fd[i] = -1;
+        s_up[i].buf = heap_caps_malloc(UP_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_up[i].len = 0;
+        s_up[i].tcp_pos = s_up[i].ble_pos = 0;
     }
     load_nvs();
 

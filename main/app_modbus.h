@@ -27,3 +27,15 @@ void app_modbus_frame(int port, const uint8_t *frame, int len, bool own_tx,
 
 // Clear the per-port request/response pairing state.
 void app_modbus_reset(int port);
+
+// Walk a raw byte burst with Modbus grammar and find complete checksum-valid
+// frame boundaries (no pairing state change). lens[] receives cumulative end
+// offsets (must be strictly increasing). Returns the number of frames found,
+// 0 when no valid frame starts at position 0. Only CRC/LRC-valid boundaries
+// are accepted, so callers never split on protocol guesswork.
+int app_modbus_scan(const uint8_t *data, int len, int *lens, int maxn);
+
+// True when `data` starts with a plausible Modbus frame whose declared total
+// length extends beyond the bytes currently present (incomplete candidate).
+// Lets callers wait for more bytes rather than flush a partial frame.
+bool app_modbus_prefix(const uint8_t *data, int len);

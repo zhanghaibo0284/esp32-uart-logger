@@ -3,3 +3,8 @@ sdkconfig.old
 managed_components/
 dependencies.lock
 .trae/
+
+# test artifacts
+tests/stress/out/
+**/__pycache__/
+*.exe

@@ -23,7 +23,9 @@
 static const char *TAG = "logger";
 
 #define FRAME_BYTES 520         // RTU max 256; ASCII ':' + 512 chars + CRLF
+#define LINE_BYTES 2048         // per-port formatted line: worst case ASCII 512B (~1570) + note (192)
 #define TXQ_DEPTH   2
+#define LED_THROTTLE_US 100000  // activity LED: at most one toggle per 100ms
 
 typedef struct {
     uint8_t *raw;               // allocated in PSRAM (large)
@@ -40,6 +42,16 @@ typedef struct {
     int len;
 } tx_req_t;
 
+// Messages for the disk writer task: RX path formats frames, writer owns files.
+#define DISK_Q_DEPTH 32
+typedef struct {
+    uint8_t kind;        // 0 = frame bytes, 1 = flush barrier
+    uint8_t port;        // frame: source port index
+    struct timeval tv;   // frame: timestamp (selects segment file)
+    uint16_t len;        // frame: valid bytes in line
+    char line[LINE_BYTES];
+} disk_msg_t;
+
 static SemaphoreHandle_t s_lock;
 static app_view_t s_view;
 static port_setting_t s_port_cfg[APP_PORT_COUNT];
@@ -53,12 +65,23 @@ static uint32_t s_repeat_ms[APP_PORT_COUNT] = {1000, 1000, 1000};
 static int64_t s_repeat_next_us[APP_PORT_COUNT];
 static uint32_t s_repeat_seq[APP_PORT_COUNT];
 static bool s_uart_on[APP_PORT_COUNT];
+static QueueHandle_t s_uart_evt[APP_PORT_COUNT];
 static FILE *s_fp[APP_PORT_COUNT];
 static time_t s_file_start[APP_PORT_COUNT];
 static frame_builder_t s_builder[APP_PORT_COUNT];
-static int64_t s_prev_poll_us[APP_PORT_COUNT];
+static char *s_linebuf[APP_PORT_COUNT];   // persistent PSRAM line buffers
 static tx_req_t s_txq[TXQ_DEPTH];
-static bool s_dirty;
+
+// Disk writer: stack in PSRAM (task never services ISRs; config permits it),
+// message queue storage also PSRAM.
+static StaticQueue_t s_diskq_ctrl;
+static uint8_t *s_diskq_store;
+static QueueHandle_t s_diskq;
+static SemaphoreHandle_t s_flush_done;
+static StaticTask_t s_writer_ctrl;
+static StackType_t *s_writer_stack;
+static int64_t s_last_led_us;
+static bool s_led_on;
 
 #define LIVE_CAP 4096
 static char s_live[APP_PORT_COUNT][LIVE_CAP];
@@ -133,7 +156,23 @@ static void close_uart(int index)
         uart_driver_delete((uart_port_t)index);
         s_uart_on[index] = false;
     }
+    if (s_uart_evt[index]) {
+        vQueueDelete(s_uart_evt[index]);
+        s_uart_evt[index] = NULL;
+    }
 }
+
+// Total bit-times per serial character with the given framing.
+static int frame_bits(const port_setting_t *ps)
+{
+    int bits = 1;                                     // start bit
+    bits += 5 + (int)ps->data_bits;                   // enum 0..3 -> 5..8 bits
+    bits += ps->parity != UART_PARITY_DISABLE ? 1 : 0;
+    bits += ps->stop_bits == UART_STOP_BITS_2 ? 2 : 1;
+    return bits;
+}
+
+static int byte_time_us(int index);   // full definition after frame builder
 
 static int open_uart(int index)
 {
@@ -156,19 +195,48 @@ static int open_uart(int index)
     if (err != ESP_OK) {
         return err;
     }
-    err = uart_driver_install((uart_port_t)index, 1024, 0, 0, NULL, 0);
+    // Event queue lets the RX TOUT ISR define frame boundaries: a UART_DATA
+    // event with timeout_flag=true ends one frame, independently of how late
+    // the logger task drains it. This prevents multi-frame gluing during disk
+    // stalls or higher-priority WiFi/BLE preemption.
+#define EVT_Q_DEPTH 24
+    s_uart_evt[index] = xQueueCreate(EVT_Q_DEPTH, sizeof(uart_event_t));
+    if (!s_uart_evt[index]) {
+        return ESP_ERR_NO_MEM;
+    }
+    // 2048B RX ring: at 115200 it absorbs ~178ms of worst-case blocked polling
+    // (fsync/maintenance), giving 2x the old margin. Falls back on low memory.
+    err = uart_driver_install((uart_port_t)index, 2048, 0, EVT_Q_DEPTH,
+                              &s_uart_evt[index], 0);
     if (err == ESP_ERR_NO_MEM) {
-        err = uart_driver_install((uart_port_t)index, 256, 0, 0, NULL, 0);
+        err = uart_driver_install((uart_port_t)index, 1024, 0, EVT_Q_DEPTH,
+                                  &s_uart_evt[index], 0);
+    }
+    if (err == ESP_ERR_NO_MEM) {
+        err = uart_driver_install((uart_port_t)index, 256, 0, EVT_Q_DEPTH,
+                                  &s_uart_evt[index], 0);
     }
     if (err != ESP_OK) {
+        vQueueDelete(s_uart_evt[index]);
+        s_uart_evt[index] = NULL;
         return err;
     }
-    uart_set_rx_full_threshold((uart_port_t)index, 1);
-    uart_set_rx_timeout((uart_port_t)index, 1);
+    // RX timeout at 3.5 character bit-times: equal to the Modbus inter-frame
+    // gap, so one timeout event corresponds to exactly one finished frame.
+    int tout = frame_bits(&s_port_cfg[index]) * 7 / 2;   // bits * 3.5
+    if (tout < 8) {
+        tout = 8;
+    }
+    if (tout > 250) {
+        tout = 250;
+    }
+    uart_set_rx_timeout((uart_port_t)index, (uint8_t)tout);
     uart_set_always_rx_timeout((uart_port_t)index, true);
     gpio_pullup_en(app_uart_rx(index));
     gpio_pulldown_dis(app_uart_rx(index));
     uart_flush_input((uart_port_t)index);
+    // Discard events generated while no consumer existed yet.
+    xQueueReset(s_uart_evt[index]);
     s_uart_on[index] = true;
     return ESP_OK;
 }
@@ -284,6 +352,8 @@ static void remember_frame(int index, const uint8_t *data, int len)
         used += snprintf(s_view.last_hex + used, sizeof(s_view.last_hex) - (size_t)used, " %02X", data[i]);
     }
     s_view.last_port = index;
+    // Event token for the UI: a new frame is available to display.
+    s_view.frame_seq++;
     xSemaphoreGive(s_lock);
 }
 
@@ -313,17 +383,19 @@ static void write_frame(int index, const struct timeval *tv,
         marker = "RX";
     }
 
-    char line[1600];
+    // Persistent per-port PSRAM buffer: no per-frame 1.6KB stack frame,
+    // reused for the single combined fwrite below.
+    char *line = s_linebuf[index];
     struct tm tm;
     localtime_r(&tv->tv_sec, &tm);
-    int used = snprintf(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d.%03ld %s ",
+    int used = snprintf(line, LINE_BYTES, "%04d-%02d-%02d %02d:%02d:%02d.%03ld %s ",
                         tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                         tm.tm_hour, tm.tm_min, tm.tm_sec, tv->tv_usec / 1000, marker);
-    for (int i = 0; i < len && used > 0 && used < (int)sizeof(line) - 4; i++) {
-        used += snprintf(line + used, sizeof(line) - (size_t)used, "%02X%s",
+    for (int i = 0; i < len && used > 0 && used < LINE_BYTES - 4; i++) {
+        used += snprintf(line + used, LINE_BYTES - (size_t)used, "%02X%s",
                          data[i], (i + 1 == len) ? "" : " ");
     }
-    if (used > 0 && used < (int)sizeof(line) - 2) {
+    if (used > 0 && used < LINE_BYTES - 2) {
         line[used++] = '\n';
         line[used] = '\0';
     }
@@ -331,38 +403,37 @@ static void write_frame(int index, const struct timeval *tv,
     remember_frame(index, data, len);
     {
         const char *tag = index == 1 ? "J2" : index == 2 ? "J3" : "U0";
-        char tagged[1640];
-        snprintf(tagged, sizeof(tagged), "%s %s", tag, line);
-        live_append(index, tagged);
+        // Two appends in the same byte order; avoids a second 1.6KB stack copy.
+        char head[12];
+        snprintf(head, sizeof(head), "%s ", tag);
+        live_append(index, head);
+        live_append(index, line);
         if (note[0]) {
-            char noted[220];
-            snprintf(noted, sizeof(noted), "%s %s\n", tag, note);
-            live_append(index, noted);
+            live_append(index, head);
+            live_append(index, note);
+            live_append(index, "\n");
         }
     }
 
-    if (!ensure_file(index, tv->tv_sec)) {
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        s_view.port[index].drop_lines++;
-        xSemaphoreGive(s_lock);
-        return;
-    }
-
-    app_fs_lock();
-    size_t need = strlen(line);
-    bool ok = fwrite(line, 1, need, s_fp[index]) == need;
-    if (ok && note[0]) {
+    size_t total = strlen(line);
+    if (note[0]) {
         size_t nlen = strlen(note);
-        ok = fwrite(note, 1, nlen, s_fp[index]) == nlen;
-        if (ok) {
-            ok = fputc('\n', s_fp[index]) == '\n';
-        }
+        memcpy(line + total, note, nlen);
+        line[total + nlen] = '\n';
+        total += nlen + 1;
     }
-    app_fs_unlock();
 
-    if (ok) {
-        s_dirty = true;
-    } else {
+    // Hand the finished line to the disk writer task; the RX path never
+    // touches files, so disk latency cannot delay frame reception.
+    disk_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.port = (uint8_t)index;
+    msg.tv = *tv;
+    msg.len = (uint16_t)total;
+    memcpy(msg.line, line, total);
+    if (!xQueueSend(s_diskq, &msg, 0)) {
+        // Writer queue (16 messages) full after an extreme FS stall: the line
+        // is lost and counted; bytes already recorded in rx counters.
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_view.port[index].drop_lines++;
         xSemaphoreGive(s_lock);
@@ -382,58 +453,82 @@ static void flush_frame(int index)
     builder->count = 0;
 }
 
-// Inter-frame silence: Modbus RTU 3.5 char times (>=19200 baud fixed 1.75ms).
-static int frame_gap_us(int index)
-{
-    uint32_t baud = s_port_cfg[index].baud ? s_port_cfg[index].baud : 115200;
-    int64_t us = (11LL * 35 * 100000) / (int64_t)baud;
-    if (us < 1750) {
-        us = 1750;
-    }
-    return (int)us;
-}
-
-// Duration of one byte on the wire: start + 8 data + parity(if used) + stop.
-static int64_t byte_time_us(int index)
-{
-    uint32_t baud = s_port_cfg[index].baud ? s_port_cfg[index].baud : 115200;
-    int bits = s_port_cfg[index].parity == UART_PARITY_DISABLE ? 10 : 11;
-    return (int64_t)bits * 1000000 / (int64_t)baud;
-}
-
-static void push_bytes(int index, const uint8_t *data, int len, int64_t now_us)
+// Write the first L assembled bytes as one frame, then compact the builder and
+// shift the timestamp for the remainder (used to split glued grammar frames).
+static void slice_frame(int index, int L)
 {
     frame_builder_t *builder = &s_builder[index];
-    bool ascii_mode = builder->active && builder->raw[0] == ':';
+    write_frame(index, &builder->first, builder->raw, L, false);
+    memmove(builder->raw, builder->raw + L, builder->count - L);
+    builder->count -= L;
+    builder->active = builder->count > 0;
+    if (builder->active) {
+        int64_t shift = (int64_t)L * byte_time_us(index);
+        struct timeval d;
+        d.tv_sec = shift / 1000000;
+        d.tv_usec = shift % 1000000;
+        timeradd(&builder->first, &d, &builder->first);
+    }
+}
 
-    // Bytes arrived only during this poll window. Estimate the bus silence
-    // before this chunk as (window length - time to send len bytes); this keeps
-    // one frame intact across consecutive polls without per-byte timestamps.
-    if (len > 0 && builder->active) {
-        int64_t window = now_us - s_prev_poll_us[index];
-        int64_t data_time = (int64_t)len * byte_time_us(index);
-        int64_t silence = window > data_time ? window - data_time : 0;
-        if ((data[0] == ':') ||
-            (ascii_mode && data[0] == '\n') ||
-            (!ascii_mode && silence >= frame_gap_us(index))) {
-            flush_frame(index);
-            ascii_mode = false;
+// True when every port is between frames (nothing in mid-assembly). Any
+// blocking maintenance on the logger task must run only in such a window so it
+// can never postpone a frame's later bytes past the inter-frame gap.
+static bool ports_idle(void)
+{
+    for (int i = 0; i < APP_PORT_COUNT; i++) {
+        if (s_builder[i].active) {
+            return false;
         }
     }
+    return true;
+}
 
-    for (int i = 0; i < len; i++) {
+// Wall time to shift one UART byte at the port's current configuration.
+static int byte_time_us(int index)
+{
+    const port_setting_t *ps = &s_port_cfg[index];
+    uint32_t baud = ps->baud ? ps->baud : 115200;
+    int us = (int)((int64_t)frame_bits(ps) * 1000000 / baud);
+    return us < 1 ? 1 : us;
+}
+
+// Wall-clock estimate for byte i in a chunk of len read at now_us. The last
+// byte finished arriving ~now; earlier bytes preceded it by one byte-time.
+// Deterministic (no jitter term), accurate to a fraction of one byte-time.
+static void stamp_arrival(frame_builder_t *builder, int index,
+                          int chunk_len, int i, int64_t now_us)
+{
+    int64_t before_us = (int64_t)(chunk_len - 1 - i) * byte_time_us(index);
+    struct timeval wall, delta;
+    gettimeofday(&wall, NULL);
+    if (before_us > 0) {
+        delta.tv_sec = before_us / 1000000;
+        delta.tv_usec = before_us % 1000000;
+        timersub(&wall, &delta, &builder->first);
+    } else {
+        builder->first = wall;
+    }
+}
+
+// Append one contiguous byte range; force_flush ends the frame at its end.
+// burst_len/range_off describe the containing event for arrival estimation.
+static void append_range(int index, const uint8_t *data, int range_len,
+                         int burst_len, int range_off, int64_t now_us, bool force_flush)
+{
+    frame_builder_t *builder = &s_builder[index];
+
+    for (int i = 0; i < range_len; i++) {
         uint8_t ch = data[i];
 
-        if (builder->active && ch == ':' && i > 0) {
-            // New ASCII frame beginning inside a chunk: finish the previous one.
+        if (builder->active && ch == ':') {
+            // New ASCII frame beginning inside a burst: finish previous one.
             flush_frame(index);
-            ascii_mode = true;
         }
         if (!builder->active) {
-            gettimeofday(&builder->first, NULL);
+            stamp_arrival(builder, index, burst_len, range_off + i, now_us);
             builder->active = true;
             builder->count = 0;
-            ascii_mode = ch == ':';
         }
         builder->raw[builder->count++] = ch;
         builder->last_us = now_us;
@@ -441,25 +536,159 @@ static void push_bytes(int index, const uint8_t *data, int len, int64_t now_us)
             flush_frame(index);
         }
     }
+    if (force_flush) {
+        flush_frame(index);
+    }
+}
+
+// Append one driver-defined event's bytes and frame the accumulated builder:
+// grammar-valid slices are written as frames; an incomplete frame candidate
+// waits for continuation (hard-flushed by the loop gap timeout). Non-Modbus
+// data at a true frame gap is logged raw, unchanged.
+static void append_burst(int index, const uint8_t *data, int len,
+                         int64_t now_us, bool frame_end)
+{
+    frame_builder_t *builder = &s_builder[index];
+    append_range(index, data, len, len, 0, now_us, false);
+
+    int bnd[8];
+    int nf = builder->count ? app_modbus_scan(builder->raw, builder->count, bnd, 8) : 0;
+    if (nf > 0) {
+        int cut = 0;
+        for (int k = 0; k < nf; k++) {
+            slice_frame(index, bnd[k] - cut);
+            cut = bnd[k];
+        }
+        // Residual tail after valid frames
+        if (builder->count > 0) {
+            if (frame_end && !app_modbus_prefix(builder->raw, builder->count)) {
+                flush_frame(index);
+            }
+            // incomplete prefix: keep waiting
+        }
+    } else if (frame_end && builder->count > 0) {
+        if (app_modbus_prefix(builder->raw, builder->count)) {
+            // Frame candidate spans beyond this event; wait for more bytes.
+        } else {
+            flush_frame(index);    // non-Modbus, true inter-frame gap: raw line
+        }
+    }
+
     app_bridge_feed_uart(index, data, (size_t)len);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_view.port[index].rx_bytes += (uint32_t)len;
     xSemaphoreGive(s_lock);
-    LED_TOGGLE();
+    // Throttled: cap at one LED toggle per 100ms to protect the I2C bus
+    // shared with touch/XL9555 from being starved.
+    if (now_us - s_last_led_us >= LED_THROTTLE_US) {
+        s_last_led_us = now_us;
+        LED_TOGGLE();
+        s_led_on = !s_led_on;
+    }
 }
 
-static void sync_files(void)
+// Consume one UART driver event.
+static void feed_uart_event(int index, const uart_event_t *ev)
 {
-    app_fs_lock();
+    if (ev->type == UART_DATA) {
+        if (ev->size <= 0) {
+            return;
+        }
+        // Bytes are already in the driver ring when the event posts; one read
+        // per event keeps ISR-defined frame identity intact.
+        static uint8_t ebuf[128];    // max FIFO-full batch, single task
+        int want = ev->size > (int)sizeof(ebuf) ? (int)sizeof(ebuf) : ev->size;
+        int n = uart_read_bytes((uart_port_t)index, ebuf, want,
+                                pdMS_TO_TICKS(50));
+        if (n > 0) {
+            append_burst(index, ebuf, n, esp_timer_get_time(), ev->timeout_flag);
+        }
+    } else if (ev->type == UART_BUFFER_FULL || ev->type == UART_FIFO_OVF) {
+        ESP_LOGW(TAG, "UART%d rx overrun event=%d size=%d", index, ev->type, ev->size);
+    }
+}
+
+// (full sync handled by the writer task flush barriers)
+
+// --- disk writer task: owns all log files; RX path never blocks on it -------
+
+static int64_t s_last_sync;
+
+static void writer_sync_all_locked(void)
+{
     for (int i = 0; i < APP_PORT_COUNT; i++) {
-        if (!s_fp[i]) {
+        if (s_fp[i]) {
+            fflush(s_fp[i]);
+            fsync(fileno(s_fp[i]));
+        }
+    }
+}
+
+// Ordered barrier: kind 1 = flush+sync all files; kind 2 = close all files
+// (used before unmount). Writer signals after everything queued before this
+// message has been handled.
+static bool writer_barrier(uint8_t kind)
+{
+    disk_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.kind = kind;
+    if (xQueueSend(s_diskq, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+    return xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(3000)) == pdTRUE;
+}
+
+static void writer_task(void *arg)
+{
+    disk_msg_t msg;
+    (void)arg;
+    while (1) {
+        if (xQueueReceive(s_diskq, &msg, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        fflush(s_fp[i]);
-        fsync(fileno(s_fp[i]));
+        if (msg.kind == 1) {
+            // Ordered flush barrier: prior messages are already written.
+            app_fs_lock();
+            writer_sync_all_locked();
+            app_fs_unlock();
+            xSemaphoreGive(s_flush_done);
+            continue;
+        }
+        if (msg.kind == 2) {
+            // Ordered close barrier: finish prior writes, then release files
+            // so the logger task can unmount the card.
+            for (int i = 0; i < APP_PORT_COUNT; i++) {
+                close_file(i);
+            }
+            xSemaphoreGive(s_flush_done);
+            continue;
+        }
+        if (msg.port >= APP_PORT_COUNT || msg.len == 0) {
+            continue;
+        }
+        bool ok = ensure_file(msg.port, msg.tv.tv_sec);
+        if (ok) {
+            app_fs_lock();
+            size_t w = fwrite(msg.line, 1, msg.len, s_fp[msg.port]);
+            app_fs_unlock();
+            ok = w == msg.len;
+        }
+        if (!ok) {
+            // File open or disk write failure (FS error/disk full): count the
+            // lost line; RX keeps running and later frames are still tried.
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_view.port[msg.port].drop_lines++;
+            xSemaphoreGive(s_lock);
+        }
+        // Periodic durability sync; runs here so it never delays reception.
+        int64_t now = esp_timer_get_time();
+        if (now - s_last_sync > 2000000) {
+            s_last_sync = now;
+            app_fs_lock();
+            writer_sync_all_locked();
+            app_fs_unlock();
+        }
     }
-    s_dirty = false;
-    app_fs_unlock();
 }
 
 static void run_sd_test(void)
@@ -525,9 +754,16 @@ static void execute_tx(int port, const uint8_t *data, int len)
     int wrote = uart_write_bytes((uart_port_t)port, data, len);
     if (wrote > 0) {
         uart_wait_tx_done((uart_port_t)port, pdMS_TO_TICKS(100));
-        // Discard loopback echo so it is not logged a second time.
+        // Discard loopback echo so it is not logged a second time. The 15ms
+        // window spans the frame tail plus the frame-gap timeout at 19200.
         uint8_t echo[FRAME_BYTES];
-        uart_read_bytes((uart_port_t)port, echo, sizeof(echo), pdMS_TO_TICKS(5));
+        uart_read_bytes((uart_port_t)port, echo, sizeof(echo), pdMS_TO_TICKS(15));
+        // Echo bytes also produced UART_DATA events; drop them so they are
+        // neither re-logged nor mistaken for real traffic.
+        uart_event_t stale;
+        while (s_uart_evt[port] &&
+               xQueueReceive(s_uart_evt[port], &stale, 0) == pdTRUE) {
+        }
     }
 
     struct timeval tv;
@@ -596,6 +832,16 @@ static void check_config_changes(int64_t now_us)
     if (now_us - last_cfg_check_us < 2000000) {
         return;
     }
+    // Same all-idle gate as the periodic fsync: stat/fopen/fread on config.json
+    // blocks several ms. If that happened after a frame's first bytes were read,
+    // the later bytes would arrive during the block and then be mistaken for a
+    // new frame (idle >= 3.5 char gap). Defer until no frame is mid-assembly;
+    // do not advance last_cfg_check_us so the next poll retries immediately.
+    for (int i = 0; i < APP_PORT_COUNT; i++) {
+        if (s_builder[i].active) {
+            return;
+        }
+    }
     last_cfg_check_us = now_us;
 
     // File is compared with the canonical snapshot: any runtime change,
@@ -608,8 +854,6 @@ static void check_config_changes(int64_t now_us)
 
 static void logger_task(void *arg)
 {
-    uint8_t buf[256];
-    int64_t last_sync_us = 0;
     int64_t last_sd_try_us = 0;
     int64_t last_usage_us = 0;
     int64_t last_time_save_us = esp_timer_get_time();
@@ -626,9 +870,8 @@ static void logger_task(void *arg)
         int64_t now_us = esp_timer_get_time();
         if (remount || (!app_sd_is_mounted() && now_us - last_sd_try_us > 8000000)) {
             last_sd_try_us = now_us;
-            for (int i = 0; i < APP_PORT_COUNT; i++) {
-                close_file(i);
-            }
+            // Writer owns the FILE pointers: have it close every file first.
+            writer_barrier(2);
             if (app_sd_mount() == ESP_OK) {
                 copy_msg(s_sd_msg, sizeof(s_sd_msg), "SD卡正常");
             } else {
@@ -658,30 +901,40 @@ static void logger_task(void *arg)
             if (!s_uart_on[i]) {
                 continue;
             }
-            int n = uart_read_bytes((uart_port_t)i, buf, sizeof(buf), 0);
-            if (n > 0) {
-                push_bytes(i, buf, n, now_us);
+            // Drain ISR-defined frame events. Bounded per loop so a large
+            // backlog (after a stall) still serves all ports, and re-checks
+            // the UART between bursts.
+            int events = 0;
+            uart_event_t ev;
+            while (events < 6 &&
+                   xQueueReceive(s_uart_evt[i], &ev, 0) == pdTRUE) {
+                feed_uart_event(i, &ev);
+                events++;
                 activity = true;
-            } else if (s_builder[i].active && now_us - s_builder[i].last_us > frame_gap_us(i)) {
+            }
+            // Incomplete frame candidate with no continuation: hard-flush the
+            // waiting bytes after 15ms (a corrupt/truncated frame).
+            frame_builder_t *b = &s_builder[i];
+            if (b->active && now_us - b->last_us > 15000) {
                 flush_frame(i);
             }
-            if (s_builder[i].active) {
-                activity = true;
-            }
-            s_prev_poll_us[i] = now_us;
+        }
+        // All ports idle: make sure the activity LED does not stay lit.
+        if (!activity && s_led_on) {
+            LED(1);
+            s_led_on = false;
         }
 
-        if (s_dirty && now_us - last_sync_us > 2000000) {
-            sync_files();
-            last_sync_us = now_us;
-        }
         check_config_changes(now_us);
-        if (now_us - last_usage_us > 30000000) {
+        // Both operations block (FAT statfs; NVS commit may erase a page).
+        // Defer without advancing the timer while a frame is mid-assembly;
+        // the next 1ms poll retries, so worst-case delay is one frame gap.
+        if (now_us - last_usage_us > 30000000 && ports_idle()) {
             app_sd_refresh_usage();
             publish_sd();
             last_usage_us = now_us;
         }
-        if (now_us - last_time_save_us > 60000000) {
+        if (now_us - last_time_save_us > 60000000 && ports_idle()) {
             app_time_persist_now();
             last_time_save_us = now_us;
         }
@@ -696,14 +949,26 @@ void app_logger_start(void)
     s_lock = xSemaphoreCreateMutex();
 
     // Large buffers live in PSRAM so the internal heap stays intact.
-    int64_t t0 = esp_timer_get_time();
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         s_builder[i].raw = heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        s_prev_poll_us[i] = t0;
+        s_linebuf[i] = heap_caps_malloc(LINE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
 
+    // Disk writer queue: message storage in PSRAM; control block internal.
+    s_diskq_store = heap_caps_malloc(DISK_Q_DEPTH * sizeof(disk_msg_t),
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_diskq = xQueueCreateStatic(DISK_Q_DEPTH, sizeof(disk_msg_t),
+                                 s_diskq_store, &s_diskq_ctrl);
+    s_flush_done = xSemaphoreCreateBinary();
+
+    // Writer stack in PSRAM (8KB; task is ISR-free): keeps 8KB internal heap
+    // free so httpd's own task allocation cannot fail.
+#define WRITER_STACK 8192
+    s_writer_stack = heap_caps_malloc(WRITER_STACK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     copy_msg(s_sd_msg, sizeof(s_sd_msg), app_sd_is_mounted() ? "SD卡正常" : "无卡");
     publish_sd();
+    xTaskCreateStatic(writer_task, "diskwr", WRITER_STACK / sizeof(StackType_t),
+                      NULL, 6, s_writer_stack, &s_writer_ctrl);
     xTaskCreatePinnedToCore(logger_task, "logger", 8192, NULL, 8, NULL, 0);
 }
 
@@ -853,13 +1118,18 @@ void app_logger_live_get(int index, uint32_t since, char *out, size_t out_len, u
 
 void app_logger_flush(void)
 {
-    sync_files();
+    if (s_diskq) {
+        writer_barrier(1);
+    }
 }
 
 void app_logger_release_files(void)
 {
+    // Push any in-flight assembly into the writer queue, then wait until all
+    // of it is on disk. Files stay open (writer owns them); readers can still
+    // open them concurrently.
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         flush_frame(i);
-        close_file(i);
     }
+    writer_barrier(1);
 }

@@ -31,7 +31,11 @@ static const uint16_t SEG_TABLE[] = {1, 10, 30, 60, 120, 360, 720, 1440};
 static lv_obj_t *s_time;
 static lv_obj_t *s_trust;
 static lv_obj_t *s_sd;
-static lv_obj_t *s_port[APP_PORT_COUNT];
+// Port rows: fixed-width tag/TX/RX labels so digit changes never relayout the
+// row and only the changed value's small area is redrawn.
+static lv_obj_t *s_port_tag[APP_PORT_COUNT];
+static lv_obj_t *s_port_tx[APP_PORT_COUNT];
+static lv_obj_t *s_port_rx[APP_PORT_COUNT];
 static lv_obj_t *s_last;
 static lv_obj_t *s_tv;
 static lv_obj_t *s_port_dd;
@@ -104,6 +108,17 @@ static lv_obj_t *make_label(lv_obj_t *parent, const char *text)
     use_cn_font(label);
     lv_obj_set_width(label, lv_pct(100));
     lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    return label;
+}
+
+// Fixed-width single-line label: no wrap/relayout, overflow is clipped.
+static lv_obj_t *make_fixed_label(lv_obj_t *parent, int w)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    use_cn_font(label);
+    lv_obj_set_width(label, w);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
     return label;
 }
 
@@ -420,7 +435,13 @@ static void build_status(lv_obj_t *tab)
     s_sd = make_label(tab, "SD卡: --");
     s_wifi_line = make_label(tab, "WIFI");
     for (int i = 0; i < APP_PORT_COUNT; i++) {
-        s_port[i] = make_label(tab, "");
+        lv_obj_t *r = make_row(tab, 22);
+        s_port_tag[i] = make_fixed_label(r, 56);
+        s_port_tx[i] = make_fixed_label(r, 104);
+        s_port_rx[i] = make_fixed_label(r, 112);
+        lv_label_set_text(s_port_tag[i], i == 1 ? "J2" : i == 2 ? "J3" : "U0");
+        lv_label_set_text(s_port_tx[i], "TX:0");
+        lv_label_set_text(s_port_rx[i], "RX:0");
     }
     s_last = make_label(tab, "最新: -");
     make_label(tab, "U0 TX43/RX44 板载口");
@@ -498,80 +519,118 @@ static void build_log(lv_obj_t *tab)
     s_log_msg = make_label(tab, "十六进制存储");
 }
 
-static void refresh_cb(lv_timer_t *timer)
+// Status-tab counters run at 1s cadence (numbers don't need 2.5Hz);
+// the always-visible clock overlay keeps the 400ms high cadence.
+static uint32_t s_last_port_tick;
+static bool s_port_first = true;
+
+static int s_tag_state[APP_PORT_COUNT] = {-1, -1, -1};
+
+static void update_port_counters(const app_view_t *view)
 {
+    for (int i = 0; i < APP_PORT_COUNT; i++) {
+        const char *tag = i == 1 ? "J2" : i == 2 ? "J3" : "U0";
+        int st = view->port[i].open ? 1 : (view->port[i].error ? 2 : 0);
+
+        if (view->port[i].open) {
+            // Identical text is skipped by LVGL; changing digits invalidate
+            // only this label's small area, not the whole row.
+            lv_label_set_text_fmt(s_port_tag[i], "%s %s", tag,
+                                  view->port[i].sending ? "发" : "开");
+            lv_label_set_text_fmt(s_port_tx[i], "TX:%llu",
+                                  (unsigned long long)view->port[i].tx_bytes);
+            lv_label_set_text_fmt(s_port_rx[i], "RX:%llu",
+                                  (unsigned long long)view->port[i].rx_bytes);
+        } else if (st != s_tag_state[i]) {
+            // Closed/error transition: tag flips once, values show dashes.
+            lv_label_set_text_fmt(s_port_tag[i], st == 2 ? "%s 失败" : "%s 关", tag);
+            lv_label_set_text(s_port_tx[i], "TX:-");
+            lv_label_set_text(s_port_rx[i], "RX:-");
+        }
+        if (st != s_tag_state[i]) {
+            lv_obj_set_style_text_color(s_port_tag[i],
+                                        st == 1 ? lv_color_hex(0x3DDC97) : lv_color_hex(0xD0D6DE), 0);
+            s_tag_state[i] = st;
+        }
+    }
+}
+
+static void do_refresh(bool force)
+{
+    // --- Overlay (always visible above the tabview): high cadence ---
     char now[24];
     app_time_format(now, sizeof(now));
     lv_label_set_text(s_time, now + 11);
-    lv_label_set_text(s_trust, app_time_is_trusted() ? "已校时" : "未校时");
+    bool trusted = app_time_is_trusted();
+    lv_label_set_text(s_trust, trusted ? "已校时" : "未校时");
     lv_obj_set_style_text_color(s_trust,
-                                app_time_is_trusted() ? lv_color_hex(0x3DDC97) : lv_color_hex(0xFFB020),
-                                0);
+                                trusted ? lv_color_hex(0x3DDC97) : lv_color_hex(0xFFB020), 0);
 
+    int tab = lv_tabview_get_tab_act(s_tv);
     app_view_t view;
     app_logger_get_view(&view);
-    if (view.sd_mounted) {
-        lv_label_set_text_fmt(s_sd, "SD卡正常  剩余 %lu MB", (unsigned long)view.sd_free_mb);
-    } else {
-        lv_label_set_text_fmt(s_sd, "SD %s", view.sd_msg[0] ? view.sd_msg : "无卡");
-    }
-    if (s_wifi_line) {
+
+    if (tab == 0) {
+        // --- Status tab ---
+        if (view.sd_mounted) {
+            lv_label_set_text_fmt(s_sd, "SD卡正常  剩余 %lu MB", (unsigned long)view.sd_free_mb);
+        } else {
+            lv_label_set_text_fmt(s_sd, "SD %s", view.sd_msg[0] ? view.sd_msg : "无卡");
+        }
         app_wifi_info_t wifi;
         app_wifi_get(&wifi);
         lv_label_set_text_fmt(s_wifi_line, wifi.up ? "WIFI %s  IP %s" : "WIFI 未开",
                               wifi.ssid, wifi.ip);
-    }
-    for (int i = 0; i < APP_PORT_COUNT; i++) {
-        const char *tag = i == 1 ? "J2" : i == 2 ? "J3" : "U0";
-        if (view.port[i].open) {
-            lv_label_set_text_fmt(s_port[i], view.port[i].sending ? "%s 发 TX:%llu RX:%llu" : "%s 开 TX:%llu RX:%llu",
-                                  tag,
-                                  (unsigned long long)view.port[i].tx_bytes,
-                                  (unsigned long long)view.port[i].rx_bytes);
-        } else if (view.port[i].error) {
-            lv_label_set_text_fmt(s_port[i], "%s 失败 %d", tag, view.port[i].error);
-        } else {
-            lv_label_set_text_fmt(s_port[i], "%s 关", tag);
+        uint32_t tick = lv_tick_get();
+        if (force || s_port_first || (int32_t)(tick - s_last_port_tick) >= 1000) {
+            s_port_first = false;
+            s_last_port_tick = tick;
+            update_port_counters(&view);
         }
-        lv_obj_set_style_text_color(s_port[i],
-                                    view.port[i].open ? lv_color_hex(0x3DDC97) : lv_color_hex(0xD0D6DE),
-                                    0);
-        if (s_tx_lbl[i]) {
-            lv_label_set_text_fmt(s_tx_lbl[i], s_tx_on[i] ? "%s停发" : "%s发送", tag);
-            lv_obj_set_style_bg_color(lv_obj_get_parent(s_tx_lbl[i]),
-                                      s_tx_on[i] ? lv_color_hex(0x1B7F4E) : lv_palette_main(LV_PALETTE_BLUE),
-                                      0);
-        }
-        if (s_open_lbl[i]) {
-            if (view.port[i].open) {
-                lv_label_set_text_fmt(s_open_lbl[i], "%s关闭", tag);
-                lv_obj_set_style_bg_color(s_open_btn[i], lv_color_hex(0x1B7F4E), 0);
-            } else if (view.port[i].error) {
-                lv_label_set_text_fmt(s_open_lbl[i], "%s失败", tag);
-                lv_obj_set_style_bg_color(s_open_btn[i], lv_color_hex(0xB42318), 0);
-            } else {
-                lv_label_set_text_fmt(s_open_lbl[i], "%s打开", tag);
-                lv_obj_set_style_bg_color(s_open_btn[i], lv_palette_main(LV_PALETTE_BLUE), 0);
+        // s_last is updated event-driven by short_poll_cb (frame_seq token).
+    } else if (tab == 1) {
+        // --- Serial tab: buttons reflect state only while visible ---
+        for (int i = 0; i < APP_PORT_COUNT; i++) {
+            const char *tag = i == 1 ? "J2" : i == 2 ? "J3" : "U0";
+            if (s_tx_lbl[i]) {
+                lv_label_set_text_fmt(s_tx_lbl[i], s_tx_on[i] ? "%s停发" : "%s发送", tag);
+                lv_obj_set_style_bg_color(lv_obj_get_parent(s_tx_lbl[i]),
+                                          s_tx_on[i] ? lv_color_hex(0x1B7F4E) : lv_palette_main(LV_PALETTE_BLUE),
+                                          0);
+            }
+            if (s_open_lbl[i]) {
+                if (view.port[i].open) {
+                    lv_label_set_text_fmt(s_open_lbl[i], "%s关闭", tag);
+                    lv_obj_set_style_bg_color(s_open_btn[i], lv_color_hex(0x1B7F4E), 0);
+                } else if (view.port[i].error) {
+                    lv_label_set_text_fmt(s_open_lbl[i], "%s失败", tag);
+                    lv_obj_set_style_bg_color(s_open_btn[i], lv_color_hex(0xB42318), 0);
+                } else {
+                    lv_label_set_text_fmt(s_open_lbl[i], "%s打开", tag);
+                    lv_obj_set_style_bg_color(s_open_btn[i], lv_palette_main(LV_PALETTE_BLUE), 0);
+                }
             }
         }
-    }
-    lv_label_set_text_fmt(s_last, "最新 %s", view.last_hex[0] ? view.last_hex : "-");
-
-    if (s_tx_msg) {
         lv_label_set_text_fmt(s_tx_msg, "J2%s  J3%s",
                               view.port[1].sending ? "发" : "停",
                               view.port[2].sending ? "发" : "停");
-    }
-    if (s_serial_msg && s_edit_port >= 0 && s_edit_port < APP_PORT_COUNT) {
-        const char *tag = s_edit_port == 1 ? "J2" : s_edit_port == 2 ? "J3" : "U0";
-        if (view.port[s_edit_port].open) {
-            lv_label_set_text_fmt(s_serial_msg, "%s 已打开", tag);
-        } else if (view.port[s_edit_port].error) {
-            lv_label_set_text_fmt(s_serial_msg, "%s 打开失败 %d", tag, view.port[s_edit_port].error);
-        } else {
-            lv_label_set_text_fmt(s_serial_msg, "%s 已关闭", tag);
+        if (s_serial_msg && s_edit_port >= 0 && s_edit_port < APP_PORT_COUNT) {
+            const char *tag = s_edit_port == 1 ? "J2" : s_edit_port == 2 ? "J3" : "U0";
+            if (view.port[s_edit_port].open) {
+                lv_label_set_text_fmt(s_serial_msg, "%s 已打开", tag);
+            } else if (view.port[s_edit_port].error) {
+                lv_label_set_text_fmt(s_serial_msg, "%s 打开失败 %d", tag, view.port[s_edit_port].error);
+            } else {
+                lv_label_set_text_fmt(s_serial_msg, "%s 已关闭", tag);
+            }
         }
     }
+}
+
+static void refresh_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    do_refresh(false);
 }
 
 // Short-press handoff: the screen task (not LVGL-safe) only sets this flag;
@@ -584,19 +643,33 @@ static void short_press_cb(int key, void *arg)
     s_short_pending = key;
 }
 
+// Last seen frame event token; s_last is touched only when it differs.
+static uint32_t s_last_frame_seq;
+
 static void short_poll_cb(lv_timer_t *timer)
 {
     (void)timer;
     int key = s_short_pending;
-    if (key < 0) {
-        return;
+    if (key >= 0) {
+        s_short_pending = -1;
+        uint16_t act = lv_tabview_get_tab_act(s_tv);
+        if (key == APP_KEY_K1) {
+            lv_tabview_set_act(s_tv, (act + 1) % 6, LV_ANIM_OFF);
+        } else {
+            lv_tabview_set_act(s_tv, (act + 5) % 6, LV_ANIM_OFF);
+        }
     }
-    s_short_pending = -1;
-    uint16_t act = lv_tabview_get_tab_act(s_tv);
-    if (key == APP_KEY_K1) {
-        lv_tabview_set_act(s_tv, (act + 1) % 6, LV_ANIM_OFF);
-    } else {
-        lv_tabview_set_act(s_tv, (act + 5) % 6, LV_ANIM_OFF);
+
+    // Event-driven latest frame: only when a frame completed (polled at
+    // 50ms/20Hz), only on the status tab; zero work when nothing changed.
+    if (lv_tabview_get_tab_act(s_tv) == 0) {
+        app_view_t view;
+        app_logger_get_view(&view);
+        if (view.frame_seq != s_last_frame_seq) {
+            s_last_frame_seq = view.frame_seq;
+            lv_label_set_text_fmt(s_last, "最新 %s",
+                                  view.last_hex[0] ? view.last_hex : "-");
+        }
     }
 }
 
@@ -605,8 +678,13 @@ static void on_tab_changed(lv_event_t *event)
     if (s_kb) {
         lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
     }
-    if (lv_tabview_get_tab_act(s_tv) == 4) {
+    int tab = lv_tabview_get_tab_act(s_tv);
+    if (tab == 4) {
         app_files_show();
+    }
+    // Entered data carries stale content while away: refresh immediately.
+    if (tab == 0 || tab == 1) {
+        do_refresh(true);
     }
 }
 
