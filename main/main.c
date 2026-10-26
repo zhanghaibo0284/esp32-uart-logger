@@ -16,6 +16,8 @@
 #include "app_wifi.h"
 #include "app_httpd.h"
 #include "app_bridge.h"
+#include "app_ota.h"
+#include "app_mbsim.h"
 #include "esp_heap_caps.h"
 #include "lvgl_port.h"
 #include "lvgl.h"
@@ -62,7 +64,12 @@ void app_main(void)
         ESP_LOGW(TAG, "config.json invalid, repairing from current settings");
         app_config_export();
     }
+    // OTA state (partition slots / pending verification) must be known before
+    // the logger starts. The Modbus simulator is started after the logger
+    // because its master role queues TX frames through app_logger_request_tx().
+    app_ota_start();
     app_logger_start();
+    app_mbsim_start();
     BaseType_t ui_ret = xTaskCreatePinnedToCore(ui_task, "ui", 16384, NULL, 4, NULL, 1);
     if (ui_ret != pdPASS) {
         ESP_LOGE(TAG, "ui task create failed: %d, internal free %u",

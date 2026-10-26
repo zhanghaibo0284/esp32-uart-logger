@@ -4,6 +4,8 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -18,6 +20,8 @@
 #include "app_bridge.h"
 #include "app_config.h"
 #include "app_modbus.h"
+#include "app_parse.h"
+#include "app_mbsim.h"
 #include "led.h"
 
 static const char *TAG = "logger";
@@ -56,9 +60,12 @@ static SemaphoreHandle_t s_lock;
 static app_view_t s_view;
 static port_setting_t s_port_cfg[APP_PORT_COUNT];
 static uint16_t s_segment_min = 60;
+static uint8_t s_disk_limit_pct = 90;
 static bool s_reload;
 static bool s_remount;
 static bool s_sd_test;
+static int s_clear_req = -2;   // -2 idle, -1 all channels, >=0 one channel
+static uint32_t s_usage_pct;   // cached SD usage, refreshed periodically
 static bool s_tx_test[APP_PORT_COUNT];
 static bool s_repeat_on[APP_PORT_COUNT];
 static uint32_t s_repeat_ms[APP_PORT_COUNT] = {1000, 1000, 1000};
@@ -246,6 +253,8 @@ static void apply_settings(void)
     app_settings_t cfg;
     app_settings_get(&cfg);
     s_segment_min = cfg.segment_min < 1 ? 60 : cfg.segment_min;
+    s_disk_limit_pct = cfg.disk_limit_pct < 1 || cfg.disk_limit_pct > 99
+                       ? 90 : cfg.disk_limit_pct;
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         bool changed = s_port_cfg[i].baud != cfg.port[i].baud ||
                        s_port_cfg[i].data_bits != cfg.port[i].data_bits ||
@@ -333,7 +342,7 @@ static bool ensure_file(int index, time_t now)
         strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
         fprintf(fp, "# UART%d TX=%d RX=%d %s\n", index, app_uart_tx(index), app_uart_rx(index), param);
         fprintf(fp, "# segment %s\n", stamp);
-        fprintf(fp, "# format: YYYY-mm-dd HH:MM:SS.mmm TX|RX[-REQ|-RSP] HEX ; # MB-* annotation\n");
+        fprintf(fp, "# format: YYYY-mm-dd HH:MM:SS.mmm TX|RX[-REQ|-RSP] HEX ; # <proto> annotation\n");
     }
     s_fp[index] = fp;
     s_file_start[index] = start;
@@ -365,22 +374,22 @@ static void write_frame(int index, const struct timeval *tv,
         return;
     }
 
-    mb_info_t mb;
+    // Parse annotation is per-port configurable: OFF writes raw HEX only.
+    ap_kind_t kind = AP_KIND_NONE;
     char note[192];
     note[0] = '\0';
-    app_modbus_frame(index, data, len, own_tx, &mb, note, sizeof(note));
+    bool parsed = app_parse_frame(s_port_cfg[index].parse_proto, index, data, len,
+                                  own_tx, &kind, note, sizeof(note));
 
     const char *marker;
     if (own_tx) {
-        marker = (mb.parsed && mb.role == MB_ROLE_REQ) ? "TX-REQ" : "TX";
-    } else if (!mb.parsed) {
+        marker = (parsed && kind == AP_KIND_REQ) ? "TX-REQ" : "TX";
+    } else if (!parsed || kind == AP_KIND_NONE || kind == AP_KIND_DATA) {
         marker = "RX";
-    } else if (mb.role == MB_ROLE_REQ) {
+    } else if (kind == AP_KIND_REQ) {
         marker = "RX-REQ";
-    } else if (mb.role == MB_ROLE_RSP) {
-        marker = "RX-RSP";
     } else {
-        marker = "RX";
+        marker = "RX-RSP";
     }
 
     // Persistent per-port PSRAM buffer: no per-frame 1.6KB stack frame,
@@ -575,6 +584,9 @@ static void append_burst(int index, const uint8_t *data, int len,
     }
 
     app_bridge_feed_uart(index, data, (size_t)len);
+    // Simulated Modbus slave/master see every burst after the log line has
+    // been queued, so neither role delays recording.
+    app_mbsim_rx(index, data, (int)len);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_view.port[index].rx_bytes += (uint32_t)len;
     xSemaphoreGive(s_lock);
@@ -689,6 +701,130 @@ static void writer_task(void *arg)
             app_fs_unlock();
         }
     }
+}
+
+// --- log retention ---------------------------------------------------------
+// Each port owns /sdcard/UART<n>; retention only ever unlinks the oldest .txt
+// file inside one port's own directory, never another channel's logs.
+
+#define TRIM_NAME_MAX 40
+
+static int oldest_log(int port, char *path, size_t cap, uint32_t *kb)
+{
+    char dir[48];
+    snprintf(dir, sizeof(dir), APP_SD_MOUNT "/UART%d", port);
+    DIR *d = opendir(dir);
+    if (!d) {
+        return -1;
+    }
+    char best[TRIM_NAME_MAX] = {0};
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *name = ent->d_name;
+        if (name[0] == '.') {
+            continue;
+        }
+        size_t n = strlen(name);
+        if (n < 4 || n >= sizeof(best) || strcmp(name + n - 4, ".txt") != 0) {
+            continue;
+        }
+        if (best[0] == '\0' || strcmp(name, best) < 0) {
+            memcpy(best, name, n + 1);
+        }
+    }
+    closedir(d);
+    if (best[0] == '\0') {
+        return -1;
+    }
+    snprintf(path, cap, "%s/%s", dir, best);
+    struct stat st;
+    if (stat(path, &st) == 0 && st.st_size > 0) {
+        *kb = (uint32_t)((st.st_size + 1023) / 1024);
+    } else {
+        *kb = 0;
+    }
+    return 0;
+}
+
+static int trim_port_logs(int port, int max_del, uint32_t *freed_kb)
+{
+    int removed = 0;
+    while (removed < max_del) {
+        char path[96];
+        uint32_t kb = 0;
+        if (oldest_log(port, path, sizeof(path), &kb) != 0) {
+            break;
+        }
+        if (unlink(path) != 0) {
+            ESP_LOGW(TAG, "unlink %s failed", path);
+            break;
+        }
+        *freed_kb += kb;
+        removed++;
+    }
+    return removed;
+}
+
+// Close all log files, delete the oldest files per channel until demand is met.
+// only_port < 0 means every channel. Runs in the logger task.
+static void clean_logs(int only_port, int max_per_port, uint32_t target_kb)
+{
+    writer_barrier(2);
+    app_fs_lock();
+    int removed = 0;
+    uint32_t freed = 0;
+    if (target_kb == 0) {
+        for (int i = 0; i < APP_PORT_COUNT; i++) {
+            if (only_port >= 0 && i != only_port) {
+                continue;
+            }
+            removed += trim_port_logs(i, max_per_port, &freed);
+        }
+    } else {
+        int rounds = max_per_port;
+        while (freed < target_kb && rounds-- > 0) {
+            int any = 0;
+            for (int i = 0; i < APP_PORT_COUNT; i++) {
+                if (only_port >= 0 && i != only_port) {
+                    continue;
+                }
+                uint32_t got = 0;
+                any += trim_port_logs(i, 1, &got);
+                freed += got;
+            }
+            if (any == 0) {
+                break;
+            }
+            removed += any;
+        }
+    }
+    app_fs_unlock();
+    if (removed > 0) {
+        app_sd_refresh_usage();
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_view.cleaned_files += (uint32_t)removed;
+        xSemaphoreGive(s_lock);
+        ESP_LOGI(TAG, "retention removed %d file(s), %lu KB", removed,
+                 (unsigned long)freed);
+    }
+    publish_sd();
+}
+
+static uint32_t sd_used_pct(uint32_t *total_mb, uint32_t *free_mb)
+{
+    uint32_t total = 0;
+    uint32_t free_space = 0;
+    app_sd_usage(&total, &free_space);
+    if (total_mb) {
+        *total_mb = total;
+    }
+    if (free_mb) {
+        *free_mb = free_space;
+    }
+    if (total == 0 || free_space > total) {
+        return 0;
+    }
+    return (uint32_t)(((uint64_t)(total - free_space) * 100) / total);
 }
 
 static void run_sd_test(void)
@@ -855,7 +991,10 @@ static void check_config_changes(int64_t now_us)
 static void logger_task(void *arg)
 {
     int64_t last_sd_try_us = 0;
-    int64_t last_usage_us = 0;
+    // Offset so the first storage check happens right after start instead of
+    // waiting a full idle interval: a card that is already above the limit
+    // must not keep filling for another 30 s.
+    int64_t last_usage_us = esp_timer_get_time() - 30000000;
     int64_t last_time_save_us = esp_timer_get_time();
     apply_settings();
     publish_sd();
@@ -881,6 +1020,19 @@ static void logger_task(void *arg)
         }
         if (reload) {
             apply_settings();
+        }
+        // Manual "clear logs" request (web/screen). Runs only between frames
+        // so deleting files never cuts a frame in half; if traffic is busy the
+        // request stays pending and is retried on the next loop.
+        int clear_port;
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        clear_port = s_clear_req;
+        xSemaphoreGive(s_lock);
+        if (clear_port != -2 && ports_idle()) {
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_clear_req = -2;
+            xSemaphoreGive(s_lock);
+            clean_logs(clear_port, 200, 0);
         }
         if (sd_test) {
             run_sd_test();
@@ -929,10 +1081,30 @@ static void logger_task(void *arg)
         // Both operations block (FAT statfs; NVS commit may erase a page).
         // Defer without advancing the timer while a frame is mid-assembly;
         // the next 1ms poll retries, so worst-case delay is one frame gap.
-        if (now_us - last_usage_us > 30000000 && ports_idle()) {
+        int64_t usage_gap = s_usage_pct >= s_disk_limit_pct ? 5000000 : 30000000;
+        if (now_us - last_usage_us > usage_gap && ports_idle()) {
             app_sd_refresh_usage();
             publish_sd();
             last_usage_us = now_us;
+            uint32_t total_mb = 0;
+            uint32_t free_mb = 0;
+            s_usage_pct = sd_used_pct(&total_mb, &free_mb);
+            if (total_mb > 0 && s_usage_pct >= s_disk_limit_pct) {
+                // Trim back to limit-5% (hysteresis) so cleaning does not run
+                // on every pass once the threshold is crossed.
+                uint32_t keep_pct = s_disk_limit_pct > 5 ? s_disk_limit_pct - 5 : 1;
+                uint32_t keep_mb = (uint32_t)(((uint64_t)total_mb * keep_pct) / 100);
+                uint32_t used_mb = total_mb - free_mb;
+                uint32_t target_kb = used_mb > keep_mb ? (used_mb - keep_mb) * 1024 : 0;
+                if (target_kb > 0) {
+                    ESP_LOGW(TAG, "sd usage %lu%% >= %u%%, trimming %lu KB",
+                             (unsigned long)s_usage_pct, s_disk_limit_pct,
+                             (unsigned long)target_kb);
+                    clean_logs(-1, 64, target_kb);
+                }
+                s_usage_pct = sd_used_pct(&total_mb, &free_mb);
+                last_usage_us = esp_timer_get_time();
+            }
         }
         if (now_us - last_time_save_us > 60000000 && ports_idle()) {
             app_time_persist_now();
@@ -997,6 +1169,16 @@ void app_logger_request_sd_test(void)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_sd_test = true;
+    xSemaphoreGive(s_lock);
+}
+
+void app_logger_request_clear_logs(int port)
+{
+    if (port < -1 || port >= APP_PORT_COUNT) {
+        return;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_clear_req = port;
     xSemaphoreGive(s_lock);
 }
 

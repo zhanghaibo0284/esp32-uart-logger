@@ -87,15 +87,87 @@ button{background:#2f6fed;color:#fff;border:0;border-radius:8px;padding:12px 14p
 </div>
 <div id="cfg-msg" class="msg"></div>
 </div>
+<div class="card">
+<h2>日志存储</h2>
+<div class="muted">存储占用率达到阈值后，记录仪按通道独立删除各自目录下最早的日志文件，绝不跨通道删除；占用回落到阈值以下即停止清理。</div>
+<div class="row">
+<label>阈值% <input id="st-limit" inputmode="numeric"></label>
+<button type="button" id="st-save">保存阈值</button>
+<span class="muted" id="st-info"></span>
+</div>
+<div class="row">
+<button type="button" data-clear="0">清理U0最早</button>
+<button type="button" data-clear="1">清理J2最早</button>
+<button type="button" data-clear="2">清理J3最早</button>
+<button type="button" data-clear="-1">每通道各清200个</button>
+</div>
+<div id="st-msg" class="msg"></div>
+</div>
+<div class="card">
+<h2>固件升级 OTA</h2>
+<div class="muted">固件先上传到TF卡暂存，校验通过后安装到备用分区并重启。新固件启动后有30秒健康确认窗口，超时未确认或主动回滚都会退回旧版本；断电时可从上一次成功槽位继续启动。</div>
+<div id="ota-info" class="muted">读取中...</div>
+<div class="row">
+<label>固件 .bin <input id="ota-file" type="file" accept=".bin,application/octet-stream"></label>
+</div>
+<div class="row">
+<button type="button" id="ota-upload">上传固件</button>
+<button type="button" id="ota-apply">安装并重启</button>
+<button type="button" id="ota-confirm">确认当前版本</button>
+<button type="button" id="ota-rollback">回滚旧版本</button>
+</div>
+<div id="ota-msg" class="msg"></div>
+</div>
+<div class="card">
+<h2>Modbus 模拟</h2>
+<div class="muted">模拟器复用记录仪的串口收发队列：从站自动应答主站请求，主站按规则轮询/写入，不会额外占用串口。同一通道不能同时做主站和从站。</div>
+<div id="mbs" class="muted">读取中...</div>
+<h2 style="margin-top:12px">RTU 从站</h2>
+<div class="row">
+<label>启用 <select id="mb-se"><option value="0">否</option><option value="1">是</option></select></label>
+<label>通道 <select id="mb-sp"><option value="0">U0</option><option value="1">J2</option><option value="2">J3</option></select></label>
+<label>从站地址 <input id="mb-sa" inputmode="numeric"></label>
+</div>
+<div class="row">
+<label>线圈起/数 <input id="mb-cs" style="width:56px"><input id="mb-cc" style="width:48px"></label>
+<label>离散起/数 <input id="mb-ds" style="width:56px"><input id="mb-dc" style="width:48px"></label>
+</div>
+<div class="row">
+<label>保持起/数 <input id="mb-hs" style="width:56px"><input id="mb-hc" style="width:48px"></label>
+<label>输入起/数 <input id="mb-is" style="width:56px"><input id="mb-ic" style="width:48px"></label>
+<button type="button" id="mb-save">保存从站</button>
+</div>
+<h2 style="margin-top:12px">RTU 主站规则</h2>
+<div id="mb-rules"></div>
+<div class="row">
+<button type="button" id="mb-add">新增规则</button>
+<button type="button" id="mb-runall">执行全部</button>
+</div>
+<h2 style="margin-top:12px">寄存器 / 线圈值</h2>
+<div class="row">
+<label>类型 <select id="mb-rt"><option value="hold">保持寄存器</option><option value="input">输入寄存器</option><option value="coil">线圈</option><option value="disc">离散输入</option></select></label>
+<label>地址 <input id="mb-ra" inputmode="numeric"></label>
+<label>值 <input id="mb-rv" inputmode="numeric"></label>
+<button type="button" id="mb-read">读</button>
+<button type="button" id="mb-write">写</button>
+</div>
+<div id="mb-msg" class="msg"></div>
+</div>
 </main>
 <script>
 const names=["U0 板载","J2","J3"];
 const bauds=[115200,9600,19200,38400,57600,230400,460800,921600,4800,2400,1200];
+const protos=[["off","不解析"],["auto","自动识别"],["modbus_rtu","Modbus RTU"],["modbus_ascii","Modbus ASCII"],["dlt645","DL/T645"],["cjt188","CJ/T188"],["ascii","ASCII 文本"]];
 let cur="/sdcard";
 let ports=[];
 function opts(list,val){
   return list.map(function(v){
     return '<option value="'+v+'"'+(String(v)===String(val)?' selected':'')+'>'+v+'</option>';
+  }).join('');
+}
+function protoOpts(val){
+  return protos.map(function(p){
+    return '<option value="'+p[0]+'"'+(p[0]===val?' selected':'')+'>'+p[1]+'</option>';
   }).join('');
 }
 function show(id,text){var el=document.getElementById(id); if(el) el.textContent=text||'';}
@@ -117,6 +189,7 @@ function renderPorts(){
       +'<div class="row"><label>数据位 <select class="bits">'+opts([8,7,6,5],p.bits)+'</select></label>'
       +'<label>停止位 <select class="stop">'+opts(['1','1.5','2'],p.stop)+'</select></label>'
       +'<label>校验 <select class="par">'+opts(['N','E','O'],p.parity)+'</select></label></div>'
+      +'<label>日志解析 <select class="parse">'+protoOpts(p.parse)+'</select></label>'
       +'<button type="button" data-act="toggle" data-i="'+i+'">'+(p.on?'关闭串口':'打开串口')+'</button>'
       +'<button type="button" data-act="apply" data-i="'+i+'">应用参数</button>'
       +'<div class="msg" id="m'+i+'"></div></div>';
@@ -151,6 +224,7 @@ function cardParams(i, on){
     bits:card.querySelector('.bits').value,
     stop:card.querySelector('.stop').value,
     parity:card.querySelector('.par').value,
+    parse:card.querySelector('.parse').value,
     on:on
   });
 }
@@ -446,6 +520,201 @@ document.getElementById('cfg-file').addEventListener('change', function(ev){
     if(r.ok){ loadStatus(true); }
   }).catch(function(){ cfgMsg('上传失败'); });
 });
+
+// --- storage retention ---
+function renderStorage(){
+  apiGet('/api/storage').then(function(s){
+    document.getElementById('st-limit').value=s.limit;
+    document.getElementById('st-info').textContent='总 '+(s.total_mb||0)+' MB / 可用 '+(s.free_mb||0)
+      +' MB，累计清理 '+s.cleaned+' 个文件';
+  }).catch(function(){ show('st-info','读取失败'); });
+}
+document.getElementById('st-save').onclick=function(){
+  var v=Number(document.getElementById('st-limit').value);
+  if(!(v>=1&&v<=99)){ show('st-msg','阈值需在 1-99 之间'); return; }
+  apiGet('/api/storage?limit='+v).then(function(r){
+    show('st-msg', r.ok?('已保存阈值 '+r.limit+'%'):(r.err||'失败'));
+    renderStorage();
+  }).catch(function(){ show('st-msg','无响应'); });
+};
+Array.prototype.forEach.call(document.querySelectorAll('[data-clear]'), function(btn){
+  btn.onclick=function(){
+    var p=btn.getAttribute('data-clear');
+    if(!confirm('确认清理最早日志？仅删除对应通道目录下的文件。')) return;
+    apiGet('/api/logs_clear?port='+p).then(function(r){
+      show('st-msg', r.ok?'已提交清理，稍候生效':(r.err||'失败'));
+    }).catch(function(){ show('st-msg','无响应'); });
+  };
+});
+
+// --- OTA ---
+const otaPhase=['空闲','下载中','待安装','安装中','切换待重启','失败','待确认','已回滚'];
+function renderOta(){
+  apiGet('/api/ota').then(function(o){
+    var t='运行槽 '+o.slot+(o.next>=0?('，备用槽 '+o.next):'')+'，版本 '+(o.version||'-')
+      +'，状态 '+(otaPhase[o.phase]||o.phase);
+    if(o.available) t+='，暂存镜像 '+Math.floor(o.total/1024)+' KB';
+    if(o.pending) t+='，新固件待确认';
+    if(o.msg) t+='，'+o.msg;
+    document.getElementById('ota-info').textContent=t;
+  }).catch(function(){ show('ota-info','读取失败'); });
+}
+document.getElementById('ota-upload').onclick=function(){
+  var f=document.getElementById('ota-file').files[0];
+  if(!f){ show('ota-msg','请选择固件文件'); return; }
+  if(f.size<131072){ show('ota-msg','固件过小，需不小于 128KB'); return; }
+  show('ota-msg','上传中 0%');
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/ota_upload');
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable) show('ota-msg','上传中 '+Math.round(e.loaded*100/e.total)+'%');
+  };
+  xhr.onload=function(){
+    var r={};
+    try{ r=JSON.parse(xhr.responseText); }catch(e){}
+    show('ota-msg', r.ok?'镜像已暂存，可点击安装':(r.err||('失败 '+xhr.status)));
+    renderOta();
+  };
+  xhr.onerror=function(){ show('ota-msg','上传失败'); };
+  xhr.send(f);
+};
+document.getElementById('ota-apply').onclick=function(){
+  if(!confirm('确认安装暂存固件并立即重启？')) return;
+  apiGet('/api/ota_action?do=apply').then(function(r){
+    show('ota-msg', r.ok?r.msg:(r.err||'失败'));
+  }).catch(function(){ show('ota-msg','设备正在重启'); });
+};
+document.getElementById('ota-confirm').onclick=function(){
+  apiGet('/api/ota_action?do=confirm').then(function(r){
+    show('ota-msg', r.ok?r.msg:(r.err||'失败'));
+    renderOta();
+  }).catch(function(){ show('ota-msg','无响应'); });
+};
+document.getElementById('ota-rollback').onclick=function(){
+  if(!confirm('确认回滚到旧版本并重启？')) return;
+  apiGet('/api/ota_action?do=rollback').then(function(r){
+    show('ota-msg', r.ok?r.msg:(r.err||'失败'));
+  }).catch(function(){ show('ota-msg','设备正在重启'); });
+};
+
+// --- Modbus simulator ---
+let mbState={slave:{}, rules:[]};
+function mbMsg(r){
+  if(!r || !r.ok){ show('mb-msg', (r&&r.err)||'失败'); return; }
+  renderSim(r);
+}
+function renderSim(s){
+  mbState=s;
+  var sl=s.slave;
+  document.getElementById('mb-se').value=sl.en?'1':'0';
+  document.getElementById('mb-sp').value=sl.port;
+  document.getElementById('mb-sa').value=sl.station;
+  document.getElementById('mb-cs').value=sl.coil[0];
+  document.getElementById('mb-cc').value=sl.coil[1];
+  document.getElementById('mb-ds').value=sl.disc[0];
+  document.getElementById('mb-dc').value=sl.disc[1];
+  document.getElementById('mb-hs').value=sl.hold[0];
+  document.getElementById('mb-hc').value=sl.hold[1];
+  document.getElementById('mb-is').value=sl.input[0];
+  document.getElementById('mb-ic').value=sl.input[1];
+  var st=s.stats||{};
+  show('mbs','从站请求 '+st.sreq+' / 应答 '+st.srsp+'，主站请求 '+st.req+' / 应答 '+st.rsp
+    +' / 超时 '+st.to+' / 异常 '+st.err);
+  renderRules(s.rules||[]);
+}
+function ruleStatus(r){
+  if(r.status===0) return '正常';
+  if(r.status===-1) return '超时';
+  if(r.status===-2) return '异常应答';
+  if(r.status===-3) return '通道未打开';
+  return '未执行';
+}
+function renderRules(rules){
+  var html=rules.map(function(r,i){
+    return '<div class="row" style="border-top:1px solid #243044;padding-top:6px" data-rule="'+i+'">'
+      +'<b>#'+i+'</b>'
+      +'<label>启用 <select class="en">'+opts([0,1],r.en)+'</select></label>'
+      +'<label>通道 <select class="port">'+opts([0,1,2],r.port)+'</select></label>'
+      +'<label>从站 <input class="slave" style="width:46px" value="'+r.slave+'"></label>'
+      +'<label>功能码 <select class="fc">'+opts([1,2,3,4,5,6,15,16],r.fc)+'</select></label>'
+      +'<label>起始 <input class="start" style="width:56px" value="'+r.start+'"></label>'
+      +'<label>数量 <input class="qty" style="width:46px" value="'+r.qty+'"></label>'
+      +'<label>值 <input class="values" style="width:96px" value="'+(r.values||[]).join(',')+'"></label>'
+      +'<label>周期ms <input class="period" style="width:64px" value="'+r.period+'"></label>'
+      +'<label>次数 <input class="repeat" style="width:46px" value="'+r.repeat+'"></label>'
+      +'<button type="button" class="save">保存</button>'
+      +'<button type="button" class="run">执行</button>'
+      +'<button type="button" class="del">删除</button>'
+      +'<span class="muted">'+ruleStatus(r)+' 请求'+r.req+' 应答'+r.rsp+' 超时'+r.to+' 异常'+r.err
+      +((r.last&&r.last.length)?(' 值['+r.last.join(',')+']'):'')+'</span></div>';
+  }).join('');
+  document.getElementById('mb-rules').innerHTML=html || '<div class="muted">暂无规则</div>';
+}
+document.getElementById('mb-save').onclick=function(){
+  var qs=[['en','mb-se'],['port','mb-sp'],['station','mb-sa'],['cs','mb-cs'],['cc','mb-cc'],
+          ['ds','mb-ds'],['dc','mb-dc'],['hs','mb-hs'],['hc','mb-hc'],['is','mb-is'],['ic','mb-ic']];
+  var q='/api/mbsim_cfg?action=slave';
+  qs.forEach(function(kv){ q+='&'+kv[0]+'='+encodeURIComponent(document.getElementById(kv[1]).value); });
+  apiGet(q).then(mbMsg).catch(function(){ show('mb-msg','无响应'); });
+};
+document.getElementById('mb-rules').addEventListener('click', function(ev){
+  var btn=ev.target;
+  if(btn.tagName!=='BUTTON') return;
+  var row=btn.parentElement;
+  var idx=row.getAttribute('data-rule');
+  if(btn.className==='del'){
+    apiGet('/api/mbsim_cfg?action=del&idx='+idx).then(mbMsg).catch(function(){ show('mb-msg','无响应'); });
+    return;
+  }
+  if(btn.className==='run'){
+    apiGet('/api/mbsim_cfg?action=run&idx='+idx).then(mbMsg).catch(function(){ show('mb-msg','无响应'); });
+    return;
+  }
+  var q='/api/mbsim_cfg?action=rule&idx='+idx
+    +'&en='+row.querySelector('.en').value
+    +'&port='+row.querySelector('.port').value
+    +'&slave='+row.querySelector('.slave').value
+    +'&fc='+row.querySelector('.fc').value
+    +'&start='+row.querySelector('.start').value
+    +'&qty='+row.querySelector('.qty').value
+    +'&period='+row.querySelector('.period').value
+    +'&repeat='+row.querySelector('.repeat').value;
+  var vals=row.querySelector('.values').value.trim();
+  if(vals) q+='&values='+encodeURIComponent(vals);
+  apiGet(q).then(mbMsg).catch(function(){ show('mb-msg','无响应'); });
+});
+document.getElementById('mb-add').onclick=function(){
+  var idx=(mbState.rules||[]).length;
+  if(idx>=8){ show('mb-msg','最多 8 条规则'); return; }
+  apiGet('/api/mbsim_cfg?action=rule&idx='+idx).then(mbMsg).catch(function(){ show('mb-msg','无响应'); });
+};
+document.getElementById('mb-runall').onclick=function(){
+  apiGet('/api/mbsim_cfg?action=run&idx=-1').then(mbMsg).catch(function(){ show('mb-msg','无响应'); });
+};
+function mbReg(write){
+  var type=document.getElementById('mb-rt').value;
+  var addr=document.getElementById('mb-ra').value.trim();
+  if(!addr){ show('mb-msg','请输入地址'); return; }
+  var q='/api/mbsim_reg?type='+type+'&addr='+encodeURIComponent(addr);
+  if(write) q+='&value='+encodeURIComponent(document.getElementById('mb-rv').value.trim());
+  apiGet(q).then(function(r){
+    if(!r.ok){ show('mb-msg', r.err||'失败'); return; }
+    show('mb-msg', write?'已写入':('地址 '+r.addr+' 当前值 '+r.value));
+  }).catch(function(){ show('mb-msg','无响应'); });
+}
+document.getElementById('mb-read').onclick=function(){ mbReg(false); };
+document.getElementById('mb-write').onclick=function(){ mbReg(true); };
+
+renderStorage();
+renderOta();
+apiGet('/api/mbsim').then(renderSim).catch(function(){ show('mbs','读取失败'); });
+setInterval(renderStorage, 8000);
+setInterval(renderOta, 3000);
+setInterval(function(){
+  var box=document.getElementById('mb-rules');
+  if(box && box.contains(document.activeElement)) return;
+  apiGet('/api/mbsim').then(renderSim).catch(function(){});
+}, 6000);
 </script>
 </body>
 </html>

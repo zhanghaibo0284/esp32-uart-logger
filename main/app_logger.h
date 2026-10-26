@@ -13,6 +13,7 @@ typedef struct {
     char last_hex[72];
     int last_port;
     uint32_t frame_seq;   // increments once per completed frame (event token)
+    uint32_t cleaned_files; // log files removed by the retention policy
     struct {
         bool open;
         int error;
@@ -43,5 +44,8 @@ void app_logger_inject(int port, const uint8_t *data, int len);
 // recorded as a TX frame. Returns false when the outbound queue is full.
 bool app_logger_request_tx(int port, const uint8_t *data, int len);
 void app_logger_live_get(int index, uint32_t since, char *out, size_t out_len, uint32_t *next);
+// Asynchronously delete oldest log files: port >= 0 clears that channel only,
+// -1 clears every channel. Runs between frames in the logger task.
+void app_logger_request_clear_logs(int port);
 void app_logger_flush(void);
 void app_logger_release_files(void);

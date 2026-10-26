@@ -19,7 +19,7 @@ static const char *TAG = "config";
 #define CFG_TMP_PATH APP_SD_MOUNT "/.cfg.tmp"
 
 #define CFG_MAGIC_TEXT "uart-logger-config"
-#define CFG_VERSION    1
+#define CFG_VERSION    2
 
 static app_config_status_t s_status = {0};
 
@@ -81,6 +81,7 @@ void app_config_build_snapshot(char *out, size_t out_len)
     cJSON_AddNumberToObject(root, "version", CFG_VERSION);
     cJSON_AddNumberToObject(root, "segment_min", settings.segment_min);
     cJSON_AddBoolToObject(root, "screen_auto_off", settings.screen_auto_off);
+    cJSON_AddNumberToObject(root, "disk_limit_pct", settings.disk_limit_pct);
 
     cJSON *ports = cJSON_AddArrayToObject(root, "ports");
     for (int i = 0; i < APP_PORT_COUNT; i++) {
@@ -101,6 +102,7 @@ void app_config_build_snapshot(char *out, size_t out_len)
         else if (p->parity == UART_PARITY_ODD) parity = "O";
         cJSON_AddStringToObject(item, "parity", parity);
         cJSON_AddBoolToObject(item, "enabled", p->enabled);
+        cJSON_AddStringToObject(item, "parse", app_parse_proto_name(p->parse_proto));
         cJSON_AddItemToArray(ports, item);
     }
 
@@ -190,12 +192,13 @@ int app_config_import_text(const char *text, size_t len)
         cJSON *version = cJSON_GetObjectItem(root, "version");
         cJSON *seg = cJSON_GetObjectItem(root, "segment_min");
         cJSON *autooff = cJSON_GetObjectItem(root, "screen_auto_off");
+        cJSON *limit = cJSON_GetObjectItem(root, "disk_limit_pct");
         cJSON *ports = cJSON_GetObjectItem(root, "ports");
         cJSON *wifi_j = cJSON_GetObjectItem(root, "wifi");
         cJSON *br = cJSON_GetObjectItem(root, "bridge");
 
         if (!str_eq(magic, CFG_MAGIC_TEXT) || !version || !cJSON_IsNumber(version) ||
-            version->valueint != CFG_VERSION) {
+            (version->valueint != 1 && version->valueint != CFG_VERSION)) {
             err = "magic/version不匹配";
             break;
         }
@@ -210,6 +213,15 @@ int app_config_import_text(const char *text, size_t len)
             err = "screen_auto_off 必须为布尔";
             break;
         }
+        if (limit) {
+            if (!cJSON_IsNumber(limit) || limit->valueint < 1 || limit->valueint > 99) {
+                err = "disk_limit_pct 无效";
+                break;
+            }
+            settings.disk_limit_pct = (uint8_t)limit->valueint;
+        } else {
+            settings.disk_limit_pct = 90;
+        }
 
         if (!ports || !cJSON_IsArray(ports) || cJSON_GetArraySize(ports) != APP_PORT_COUNT) {
             err = "ports字段无效";
@@ -222,6 +234,7 @@ int app_config_import_text(const char *text, size_t len)
             cJSON *stop = it ? cJSON_GetObjectItem(it, "stop") : NULL;
             cJSON *par = it ? cJSON_GetObjectItem(it, "parity") : NULL;
             cJSON *en = it ? cJSON_GetObjectItem(it, "enabled") : NULL;
+            cJSON *parse = it ? cJSON_GetObjectItem(it, "parse") : NULL;
             if (!baud || !cJSON_IsNumber(baud) || baud->valuedouble < 300 || baud->valuedouble > 2000000 ||
                 !bits || !cJSON_IsNumber(bits) || !en || !cJSON_IsBool(en)) {
                 err = "串口参数无效";
@@ -244,6 +257,16 @@ int app_config_import_text(const char *text, size_t len)
             else if (str_eq(par, "O")) settings.port[i].parity = UART_PARITY_ODD;
             else { err = "校验位无效"; goto invalid; }
             settings.port[i].enabled = cJSON_IsTrue(en);
+            // Optional (v1 files and older web clients omit it): keep current.
+            if (parse) {
+                uint8_t proto = APP_PARSE_OFF;
+                if (!cJSON_IsString(parse) ||
+                    !app_parse_proto_from_name(parse->valuestring, &proto)) {
+                    err = "parse 协议名无效";
+                    goto invalid;
+                }
+                settings.port[i].parse_proto = proto;
+            }
         }
 
         if (!wifi_j) {

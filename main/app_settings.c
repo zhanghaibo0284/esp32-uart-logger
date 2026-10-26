@@ -13,8 +13,9 @@ static const char *NVS_NS = "logger";
 static const char *NVS_KEY = "cfg";
 
 #define CFG_MAGIC 0x4C4F4731u
-#define CFG_VERSION 3
+#define CFG_VERSION 4
 #define V2_BLOB_SIZE 32   // size of the version-2 blob (without screen_auto_off)
+#define DISK_LIMIT_DEFAULT 90
 
 typedef struct {
     uint32_t magic;
@@ -26,6 +27,8 @@ typedef struct {
     uint8_t parity[APP_PORT_COUNT];
     uint8_t enabled[APP_PORT_COUNT];
     uint8_t screen_auto_off;
+    uint8_t parse_proto[APP_PORT_COUNT]; // v4
+    uint8_t disk_limit_pct;              // v4
 } cfg_blob_t;
 
 static app_settings_t s_cfg;
@@ -36,12 +39,14 @@ static void set_defaults(app_settings_t *cfg)
     memset(cfg, 0, sizeof(*cfg));
     cfg->segment_min = 60;
     cfg->screen_auto_off = true;
+    cfg->disk_limit_pct = DISK_LIMIT_DEFAULT;
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         cfg->port[i].baud = 115200;
         cfg->port[i].data_bits = UART_DATA_8_BITS;
         cfg->port[i].stop_bits = UART_STOP_BITS_1;
         cfg->port[i].parity = UART_PARITY_DISABLE;
         cfg->port[i].enabled = false;
+        cfg->port[i].parse_proto = APP_PARSE_OFF;
     }
     cfg->port[1].enabled = true;
 }
@@ -54,7 +59,7 @@ static bool baud_ok(uint32_t baud)
 static bool blob_ok(const cfg_blob_t *blob)
 {
     if (blob->magic != CFG_MAGIC ||
-        (blob->version != 2 && blob->version != CFG_VERSION)) {
+        blob->version < 2 || blob->version > CFG_VERSION) {
         return false;
     }
     if (blob->segment_min < 1 || blob->segment_min > 24 * 60) {
@@ -75,6 +80,12 @@ static bool blob_ok(const cfg_blob_t *blob)
             blob->parity[i] != UART_PARITY_ODD) {
             return false;
         }
+        if (blob->parse_proto[i] >= APP_PARSE_PROTO_MAX) {
+            return false;
+        }
+    }
+    if (blob->disk_limit_pct > 99) {
+        return false;
     }
     return true;
 }
@@ -84,12 +95,15 @@ static void from_blob(const cfg_blob_t *blob, app_settings_t *cfg)
     cfg->segment_min = blob->segment_min;
     // v2 blobs have no stored flag (read buffer zeroed); default to enabled.
     cfg->screen_auto_off = blob->version == 2 ? true : blob->screen_auto_off != 0;
+    cfg->disk_limit_pct = blob->disk_limit_pct == 0 ? DISK_LIMIT_DEFAULT
+                                                    : blob->disk_limit_pct;
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         cfg->port[i].baud = blob->baud[i];
         cfg->port[i].data_bits = (uart_word_length_t)blob->data_bits[i];
         cfg->port[i].stop_bits = (uart_stop_bits_t)blob->stop_bits[i];
         cfg->port[i].parity = (uart_parity_t)blob->parity[i];
         cfg->port[i].enabled = blob->enabled[i] != 0;
+        cfg->port[i].parse_proto = blob->parse_proto[i];
     }
 }
 
@@ -100,12 +114,14 @@ static void to_blob(const app_settings_t *cfg, cfg_blob_t *blob)
     blob->version = CFG_VERSION;
     blob->segment_min = cfg->segment_min;
     blob->screen_auto_off = cfg->screen_auto_off ? 1 : 0;
+    blob->disk_limit_pct = cfg->disk_limit_pct;
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         blob->baud[i] = cfg->port[i].baud;
         blob->data_bits[i] = (uint8_t)cfg->port[i].data_bits;
         blob->stop_bits[i] = (uint8_t)cfg->port[i].stop_bits;
         blob->parity[i] = (uint8_t)cfg->port[i].parity;
         blob->enabled[i] = cfg->port[i].enabled ? 1 : 0;
+        blob->parse_proto[i] = cfg->port[i].parse_proto;
     }
 }
 
@@ -149,11 +165,12 @@ void app_settings_init(void)
     size_t size = sizeof(blob);
     esp_err_t err = nvs_get_blob(handle, NVS_KEY, &blob, &size);
     nvs_close(handle);
-    bool size_ok = size == sizeof(blob) || size == V2_BLOB_SIZE;
+    bool size_ok = size >= V2_BLOB_SIZE && size <= sizeof(blob);
     if (err == ESP_OK && size_ok && blob_ok(&blob)) {
         from_blob(&blob, &s_cfg);
-        ESP_LOGI(TAG, "settings loaded v%u, segment=%u auto_off=%d",
-                 blob.version, s_cfg.segment_min, s_cfg.screen_auto_off ? 1 : 0);
+        ESP_LOGI(TAG, "settings loaded v%u, segment=%u auto_off=%d limit=%u",
+                 blob.version, s_cfg.segment_min, s_cfg.screen_auto_off ? 1 : 0,
+                 s_cfg.disk_limit_pct);
     } else {
         ESP_LOGW(TAG, "settings invalid, use defaults");
     }
@@ -172,9 +189,15 @@ void app_settings_save(const app_settings_t *in)
     if (cfg.segment_min < 1 || cfg.segment_min > 24 * 60) {
         cfg.segment_min = 60;
     }
+    if (cfg.disk_limit_pct < 1 || cfg.disk_limit_pct > 99) {
+        cfg.disk_limit_pct = DISK_LIMIT_DEFAULT;
+    }
     for (int i = 0; i < APP_PORT_COUNT; i++) {
         if (!baud_ok(cfg.port[i].baud)) {
             cfg.port[i].baud = 115200;
+        }
+        if (cfg.port[i].parse_proto >= APP_PARSE_PROTO_MAX) {
+            cfg.port[i].parse_proto = APP_PARSE_OFF;
         }
     }
 

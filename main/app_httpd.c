@@ -22,10 +22,13 @@
 #include "app_time.h"
 #include "app_wifi.h"
 #include "app_bridge.h"
+#include "app_ota.h"
+#include "app_mbsim.h"
+#include "app_parse.h"
 
 static const char *TAG = "httpd";
 static httpd_handle_t s_server;
-static const char WEB_PAGE[] = "<!DOCTYPE html>\r\n<html lang=\"zh\">\r\n<head>\r\n<meta charset=\"utf-8\">\r\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\r\n<title>串口记录仪</title>\r\n<style>\r\nbody{font:16px/1.45 -apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;margin:0;background:#0f1419;color:#e8eef5}\r\nheader,main{padding:12px}\r\nh1{font-size:20px;margin:0 0 6px}\r\nh2{font-size:16px;margin:0 0 8px}\r\n.card{background:#1b2430;border-radius:10px;padding:10px;margin:10px 0}\r\nlabel{display:block;margin:6px 0;color:#b7c3d1}\r\nselect,input,button{font-size:16px}\r\ninput{width:64px;padding:6px;border-radius:6px;border:0}\r\nbutton{background:#2f6fed;color:#fff;border:0;border-radius:8px;padding:12px 14px;margin:6px 6px 0 0}\r\n.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}\r\n.muted{color:#9aa8b8}\r\n.line{display:flex;align-items:center;gap:8px;margin:8px 0}\r\n.item{flex:1;display:block;color:#d7e6ff;text-decoration:none;background:#243044;border-radius:8px;padding:12px}\r\n.pick{width:22px;height:22px}\r\n#crumb a{color:#8ec5ff;margin-right:4px}\r\n.msg{min-height:1.2em;color:#ffd27a}\r\n#live{height:240px;overflow:auto;background:#0b0f14;padding:8px;white-space:pre-wrap;font:13px/1.35 ui-monospace,monospace}\n#cfg-file{width:auto;padding:0;background:none;border-radius:0}\r\n</style>\r\n</head>\r\n<body>\r\n<header>\r\n<h1>串口记录仪</h1>\r\n<div id=\"info\" class=\"muted\">正在读取...</div>\r\n</header>\r\n<main>\r\n<div id=\"ports\"></div>\r\n<div class=\"card\">\r\n<h2>串口透传</h2>\r\n<div class=\"muted\">WiFi TCP：用电脑 TCP 工具连接 192.168.4.1 对应端口即可双向透传。蓝牙为 BLE UART(NUS)，手机需用 BLE 调试工具(如 nRF Connect) 连接。</div>\r\n<div id=\"bridge\"></div>\r\n<div id=\"bridge-msg\" class=\"msg\"></div>\r\n</div>\r\n<div class=\"card\">\r\n<h2>实时数据</h2>\r\n<div class=\"row\">\r\n<label><input id=\"lv0\" class=\"pick\" type=\"checkbox\"> U0</label>\r\n<label><input id=\"lv1\" class=\"pick\" type=\"checkbox\" checked> J2</label>\r\n<label><input id=\"lv2\" class=\"pick\" type=\"checkbox\" checked> J3</label>\r\n<button type=\"button\" id=\"lv-clear\">清空</button>\r\n</div>\r\n<pre id=\"live\"></pre>\r\n</div>\r\n<div class=\"card\">\r\n<h2>校时</h2>\r\n<div class=\"row\">\r\n<label>年 <input id=\"yy\" inputmode=\"numeric\"></label>\r\n<label>月 <input id=\"mo\" inputmode=\"numeric\"></label>\r\n<label>日 <input id=\"dd\" inputmode=\"numeric\"></label>\r\n</div>\r\n<div class=\"row\">\r\n<label>时 <input id=\"hh\" inputmode=\"numeric\"></label>\r\n<label>分 <input id=\"mm\" inputmode=\"numeric\"></label>\r\n<label>秒 <input id=\"ss\" inputmode=\"numeric\"></label>\r\n</div>\r\n<button type=\"button\" id=\"btn-time\">校时</button>\r\n<button type=\"button\" id=\"btn-phone\">用手机时间</button>\r\n<div id=\"time-msg\" class=\"msg\"></div>\r\n</div>\r\n<div class=\"card\">\r\n<h2>日志文件</h2>\r\n<div id=\"crumb\" class=\"muted\"></div>\r\n<button type=\"button\" id=\"btn-all\">全选</button>\r\n<button type=\"button\" id=\"btn-zip\">下载选中</button>\r\n<button type=\"button\" id=\"btn-zipall\">下载全部</button>\r\n<div id=\"files\"></div>\r\n<div id=\"file-msg\" class=\"msg\"></div>\r\n</div>\r\n<div class=\"card\">\r\n<h2>配置管理</h2>\r\n<div class=\"muted\">config.json 位于TF卡根目录：屏幕或本页修改参数都会自动写入，每次覆盖自动备份 config.json.bak。WiFi名称/密码与透传开关经文件加载后在下次启动生效。</div>\r\n<div class=\"row\">\r\n<button type=\"button\" id=\"cfg-download\">下载config.json</button>\r\n<button type=\"button\" id=\"cfg-export\">立即导出</button>\r\n<button type=\"button\" id=\"cfg-reload\">从卡重载</button>\r\n<button type=\"button\" id=\"cfg-restore\">恢复备份</button>\r\n</div>\r\n<div class=\"row\">\r\n<label>上传config.json <input id=\"cfg-file\" type=\"file\" accept=\".json,application/json\"></label>\r\n</div>\r\n<div id=\"cfg-msg\" class=\"msg\"></div>\r\n</div>\r\n</main>\r\n<script>\r\nconst names=[\"U0 板载\",\"J2\",\"J3\"];\r\nconst bauds=[115200,9600,19200,38400,57600,230400,460800,921600,4800,2400,1200];\r\nlet cur=\"/sdcard\";\r\nlet ports=[];\r\nfunction opts(list,val){\r\n  return list.map(function(v){\r\n    return '<option value=\"'+v+'\"'+(String(v)===String(val)?' selected':'')+'>'+v+'</option>';\r\n  }).join('');\r\n}\r\nfunction show(id,text){var el=document.getElementById(id); if(el) el.textContent=text||'';}\r\nfunction fillTime(text){\r\n  var m=/(\\d{4})-(\\d{2})-(\\d{2}) (\\d{2}):(\\d{2}):(\\d{2})/.exec(text||'');\r\n  if(!m) return;\r\n  document.getElementById('yy').value=m[1];\r\n  document.getElementById('mo').value=String(Number(m[2]));\r\n  document.getElementById('dd').value=String(Number(m[3]));\r\n  document.getElementById('hh').value=String(Number(m[4]));\r\n  document.getElementById('mm').value=String(Number(m[5]));\r\n  document.getElementById('ss').value=String(Number(m[6]));\r\n}\r\nfunction renderPorts(){\r\n  document.getElementById('ports').innerHTML=ports.map(function(p,i){\r\n    var st=p.open?('已打开 TX '+p.tx+' RX '+p.rx):(p.err?('失败 '+p.err):'已关闭');\r\n    return '<div class=\"card\" id=\"p'+i+'\"><b>'+names[i]+'</b> <span class=\"st\">'+st+'</span>'\r\n      +'<label>波特率 <select class=\"baud\">'+opts(bauds,p.baud)+'</select></label>'\r\n      +'<div class=\"row\"><label>数据位 <select class=\"bits\">'+opts([8,7,6,5],p.bits)+'</select></label>'\r\n      +'<label>停止位 <select class=\"stop\">'+opts(['1','1.5','2'],p.stop)+'</select></label>'\r\n      +'<label>校验 <select class=\"par\">'+opts(['N','E','O'],p.parity)+'</select></label></div>'\r\n      +'<button type=\"button\" data-act=\"toggle\" data-i=\"'+i+'\">'+(p.on?'关闭串口':'打开串口')+'</button>'\r\n      +'<button type=\"button\" data-act=\"apply\" data-i=\"'+i+'\">应用参数</button>'\r\n      +'<div class=\"msg\" id=\"m'+i+'\"></div></div>';\r\n  }).join('');\r\n}\r\nasync function loadStatus(fill){\r\n  try{\r\n    const s=await (await fetch('/api/status')).json();\r\n    show('info', s.time+'  '+(s.sd?('SD '+s.free_mb+' MB'):'无卡')+'  '+s.ssid);\r\n    if(fill){\r\n      ports=s.ports;\r\n      renderPorts();\r\n      fillTime(s.time);\r\n    }else{\r\n      s.ports.forEach(function(p,i){\r\n        ports[i].open=p.open; ports[i].tx=p.tx; ports[i].rx=p.rx; ports[i].err=p.err; ports[i].on=p.on;\r\n        var el=document.querySelector('#p'+i+' .st');\r\n        if(el) el.textContent=p.open?('已打开 TX '+p.tx+' RX '+p.rx):(p.err?('失败 '+p.err):'已关闭');\r\n        var btn=document.querySelector('#p'+i+' button[data-act=\"toggle\"]');\r\n        if(btn) btn.textContent=p.on?'关闭串口':'打开串口';\r\n      });\r\n    }\r\n  }catch(e){\r\n    show('info','读取失败');\r\n  }\r\n}\r\nfunction cardParams(i, on){\r\n  var card=document.getElementById('p'+i);\r\n  return new URLSearchParams({\r\n    index:String(i),\r\n    baud:card.querySelector('.baud').value,\r\n    bits:card.querySelector('.bits').value,\r\n    stop:card.querySelector('.stop').value,\r\n    parity:card.querySelector('.par').value,\r\n    on:on\r\n  });\r\n}\r\nasync function savePort(i, on){\r\n  show('m'+i,'请稍候');\r\n  try{\r\n    const r=await fetch('/api/port?'+cardParams(i,on).toString());\r\n    const j=await r.json();\r\n    show('m'+i, j.ok?(on==='1'?'已打开':'已关闭'):(j.err||'失败'));\r\n    if(j.ok){ ports[i].on=(on==='1'); }\r\n    await loadStatus(false);\r\n  }catch(e){\r\n    show('m'+i,'无响应');\r\n  }\r\n}\r\ndocument.getElementById('ports').addEventListener('click', function(ev){\r\n  var node=ev.target;\r\n  while(node && node.tagName!=='BUTTON') node=node.parentNode;\r\n  if(!node || !node.dataset) return;\r\n  var i=Number(node.dataset.i);\r\n  if(node.dataset.act==='toggle'){\r\n    savePort(i, ports[i] && ports[i].on ? '0' : '1');\r\n  }else if(node.dataset.act==='apply'){\r\n    savePort(i, (ports[i] && ports[i].on) ? '1' : '0');\r\n  }\r\n});\r\ndocument.getElementById('btn-time').addEventListener('click', async function(){\r\n  show('time-msg','请稍候');\r\n  var body=new URLSearchParams({\r\n    y:document.getElementById('yy').value,\r\n    mo:document.getElementById('mo').value,\r\n    d:document.getElementById('dd').value,\r\n    h:document.getElementById('hh').value,\r\n    mi:document.getElementById('mm').value,\r\n    s:document.getElementById('ss').value\r\n  });\r\n  try{\r\n    const r=await fetch('/api/time?'+body.toString());\r\n    const j=await r.json();\r\n    show('time-msg', j.ok?('校时成功 '+j.time):(j.err||'日期无效'));\r\n    if(j.ok) show('info', j.time);\r\n  }catch(e){\r\n    show('time-msg','无响应');\r\n  }\r\n});\r\nfunction safeDir(path){\r\n  if(!path || path.indexOf('/sdcard')!==0 || path.indexOf('..')>=0) return '/sdcard';\r\n  return path;\r\n}\r\nfunction upPath(path){\r\n  path=safeDir(path);\r\n  if(path==='/sdcard') return '/sdcard';\r\n  var i=path.lastIndexOf('/');\r\n  return i<=7?'/sdcard':path.slice(0,i);\r\n}\r\nfunction renderCrumb(path){\r\n  var box=document.getElementById('crumb');\r\n  box.innerHTML='';\r\n  var acc='';\r\n  path.split('/').forEach(function(part){\r\n    if(!part) return;\r\n    acc+='/'+part;\r\n    if(box.childNodes.length){\r\n      var sep=document.createElement('span');\r\n      sep.textContent=' / ';\r\n      box.appendChild(sep);\r\n    }\r\n    var a=document.createElement('a');\r\n    a.textContent=part;\r\n    a.href='/?dir='+encodeURIComponent(acc);\r\n    a.setAttribute('data-dir','1');\r\n    a.setAttribute('data-path',acc);\r\n    box.appendChild(a);\r\n  });\r\n}\r\nasync function loadFiles(path){\r\n  cur=safeDir(path);\r\n  show('file-msg','');\r\n  try{\r\n    const r=await fetch('/api/files?path='+encodeURIComponent(cur));\r\n    const s=await r.json();\r\n    if(s.err){ show('file-msg', s.err); }\r\n    var shown=safeDir(s.path||cur);\r\n    cur=shown;\r\n    renderCrumb(shown);\r\n    var box=document.getElementById('files');\r\n    box.innerHTML='';\r\n    if(shown!=='/sdcard'){\r\n      var back=document.createElement('a');\r\n      back.className='item';\r\n      back.textContent='.. 返回';\r\n      back.href='/?dir='+encodeURIComponent(upPath(shown));\r\n      back.setAttribute('data-dir','1');\r\n      back.setAttribute('data-path', upPath(shown));\r\n      var line0=document.createElement('div');\r\n      line0.className='line';\r\n      line0.appendChild(back);\r\n      box.appendChild(line0);\r\n    }\r\n    (s.items||[]).forEach(function(it){\r\n      var full=shown+'/'+it.name;\r\n      var line=document.createElement('div');\r\n      line.className='line';\r\n      if(!it.dir){\r\n        var ck=document.createElement('input');\r\n        ck.type='checkbox';\r\n        ck.className='pick';\r\n        ck.setAttribute('data-name', it.name);\r\n        line.appendChild(ck);\r\n      }\r\n      var a=document.createElement('a');\r\n      a.className='item';\r\n      if(it.dir){\r\n        a.textContent=it.name+'/';\r\n        a.href='/?dir='+encodeURIComponent(full);\r\n        a.setAttribute('data-dir','1');\r\n        a.setAttribute('data-path', full);\r\n      }else{\r\n        a.textContent=it.name+'  '+it.size;\r\n        a.href='/dl?path='+encodeURIComponent(full);\r\n      }\r\n      line.appendChild(a);\r\n      box.appendChild(line);\r\n    });\r\n    if(!(s.items||[]).length){\r\n      var empty=document.createElement('div');\r\n      empty.className='muted';\r\n      empty.textContent='空';\r\n      box.appendChild(empty);\r\n    }\r\n  }catch(e){\r\n    show('file-msg','目录读取失败');\r\n  }\r\n}\r\nfunction onDirClick(ev){\r\n  var node=ev.target;\r\n  while(node && node.tagName!=='A') node=node.parentNode;\r\n  if(!node || node.getAttribute('data-dir')!=='1') return;\r\n  ev.preventDefault();\r\n  loadFiles(node.getAttribute('data-path'));\r\n}\r\ndocument.getElementById('crumb').addEventListener('click', onDirClick);\r\ndocument.getElementById('files').addEventListener('click', onDirClick);\r\ndocument.getElementById('btn-all').addEventListener('click', function(){\r\n  var boxes=document.querySelectorAll('#files .pick');\r\n  var mark=false;\r\n  for(var i=0;i<boxes.length;i++){ if(!boxes[i].checked) mark=true; }\r\n  for(var j=0;j<boxes.length;j++) boxes[j].checked=mark;\r\n});\r\nfunction selectedNames(){\r\n  var names=[];\r\n  var boxes=document.querySelectorAll('#files .pick');\r\n  for(var i=0;i<boxes.length;i++){\r\n    if(boxes[i].checked) names.push(boxes[i].getAttribute('data-name'));\r\n  }\r\n  return {names:names, total:boxes.length};\r\n}\r\ndocument.getElementById('btn-zip').addEventListener('click', function(){\r\n  var sel=selectedNames();\r\n  if(!sel.names.length){ show('file-msg','请选择文件'); return; }\r\n  if(sel.names.length===sel.total){\r\n    window.location.href='/api/zip?dir='+encodeURIComponent(cur)+'&all=1';\r\n    return;\r\n  }\r\n  var q='/api/zip?dir='+encodeURIComponent(cur)+'&names='+encodeURIComponent(sel.names.join('|'));\r\n  if(q.length>1500){ show('file-msg','选中太多,请用下载全部'); return; }\r\n  window.location.href=q;\r\n});\r\ndocument.getElementById('btn-zipall').addEventListener('click', function(){\r\n  window.location.href='/api/zip?dir='+encodeURIComponent(cur)+'&all=1';\r\n});\r\ndocument.getElementById('btn-phone').addEventListener('click', async function(){\r\n  var d=new Date();\r\n  document.getElementById('yy').value=d.getFullYear();\r\n  document.getElementById('mo').value=d.getMonth()+1;\r\n  document.getElementById('dd').value=d.getDate();\r\n  document.getElementById('hh').value=d.getHours();\r\n  document.getElementById('mm').value=d.getMinutes();\r\n  document.getElementById('ss').value=d.getSeconds();\r\n  show('time-msg','请稍候');\r\n  var body=new URLSearchParams({\r\n    y:d.getFullYear(), mo:d.getMonth()+1, d:d.getDate(),\r\n    h:d.getHours(), mi:d.getMinutes(), s:d.getSeconds()\r\n  });\r\n  try{\r\n    const r=await fetch('/api/time?'+body.toString());\r\n    const j=await r.json();\r\n    show('time-msg', j.ok?('校时成功 '+j.time):(j.err||'日期无效'));\r\n    if(j.ok) show('info', j.time);\r\n  }catch(e){\r\n    show('time-msg','无响应');\r\n  }\r\n});\r\n\r\n\r\nlet liveCursor=[0,0,0];\r\ndocument.getElementById('lv-clear').addEventListener('click', function(){\r\n  document.getElementById('live').textContent='';\r\n  liveCursor=[0,0,0];\r\n});\r\nasync function pollLive(){\r\n  var q=[];\r\n  for(var i=0;i<3;i++){\r\n    var box=document.getElementById('lv'+i);\r\n    if(box && box.checked) q.push(i+'='+liveCursor[i]);\r\n  }\r\n  if(!q.length) return;\r\n  try{\r\n    const s=await (await fetch('/api/live?'+q.join('&'))).json();\r\n    var view=document.getElementById('live');\r\n    var stick=view.scrollTop+view.clientHeight>=view.scrollHeight-24;\r\n    (s.ports||[]).forEach(function(p){\r\n      liveCursor[p.i]=p.next;\r\n      if(p.text) view.textContent+=p.text;\r\n    });\r\n    if(view.textContent.length>24000) view.textContent=view.textContent.slice(-14000);\r\n    if(stick) view.scrollTop=view.scrollHeight;\r\n  }catch(e){}\r\n}\r\n\r\nloadStatus(true);\r\nvar startDir='/sdcard';\r\ntry{ var qs=new URLSearchParams(location.search); startDir=safeDir(qs.get('dir')||'/sdcard'); }catch(e){}\r\nloadFiles(startDir);\r\nsetInterval(function(){loadStatus(false);},2000);\r\nsetInterval(pollLive,500);\r\n\nfunction apiGet(url){ return fetch(url).then(function(r){return r.json();}); }\nfunction renderBridge(){\n  apiGet('/api/bridge').then(function(b){\n    var labels=['U0','J2','J3'];\n    var rows=b.tcp.map(function(t,i){\n      return '<div class=\"line\"><b style=\"width:34px\">'+labels[i]+'</b>'\n        +'<label>TCP端口 <input class=\"bport\" style=\"width:90px\" value=\"'+t.port+'\"></label>'\n        +'<button type=\"button\" class=\"btcp\" data-i=\"'+i+'\">'+(t.on?('停止(客户端'+t.clients+')'):'开启TCP')+'</button>'\n        +'<span class=\"muted\">收'+t.rx+' 发'+t.tx+'</span></div>';\n    }).join('');\n    var ble=b.ble;\n    rows+='<div class=\"line\"><b style=\"width:34px\">BLE</b>'\n      +'<label>绑定 <select id=\"ble-port\"><option value=\"0\">U0</option><option value=\"1\"'+(ble.port===1?' selected':'')+'>J2</option><option value=\"2\"'+(ble.port===2?' selected':'')+'>J3</option></select></label>'\n      +'<label>名称 <input id=\"ble-name\" style=\"width:120px\" value=\"'+ble.name+'\"></label>'\n      +'<button type=\"button\" id=\"b-ble\">'+(ble.on?(ble.connected?'已连接,停止':'广播中,停止'):'开启BLE')+'</button>'\n      +'<span class=\"muted\">收'+ble.rx+' 发'+ble.tx+'</span></div>';\n    document.getElementById('bridge').innerHTML=rows;\n    Array.prototype.forEach.call(document.querySelectorAll('.btcp'),function(btn){\n      btn.onclick=function(){\n        var i=btn.getAttribute('data-i');\n        var on=btn.textContent.indexOf('开启')===0;\n        var port=btn.parentElement.querySelector('.bport').value;\n        apiGet('/api/bridge_tcp?index='+i+'&on='+(on?1:0)+'&port='+port).then(function(r){\n          show('bridge-msg',r.ok?'已更新':('失败 '+(r.err||''))); renderBridge();\n        });\n      };\n    });\n    document.getElementById('b-ble').onclick=function(){\n      var on=document.getElementById('b-ble').textContent.indexOf('开启')===0;\n      var p=document.getElementById('ble-port').value;\n      var nm=encodeURIComponent(document.getElementById('ble-name').value);\n      apiGet('/api/bridge_ble?index='+p+'&on='+(on?1:0)+'&name='+nm).then(function(r){\n        show('bridge-msg',r.ok?'已更新':('失败 '+(r.err||''))); renderBridge();\n      });\n    };\n  });\n}\n\nsetInterval(renderBridge, 3000);\n\n// --- configuration management ---\nfunction cfgMsg(text){ show('cfg-msg', text); }\ndocument.getElementById('cfg-download').onclick = function(){\n  window.location.href='/dl?path='+encodeURIComponent('/sdcard/config.json');\n};\nfunction cfgOp(op, done){\n  cfgMsg('请稍候');\n  apiGet('/api/config?op='+op).then(function(r){\n    cfgMsg(r.ok ? (r.msg||'完成') : (r.err||'失败'));\n    if(r.ok) { loadStatus(true); }\n    if(done) done(r);\n  }).catch(function(){ cfgMsg('无响应'); });\n}\ndocument.getElementById('cfg-export').onclick = function(){ cfgOp('export'); };\ndocument.getElementById('cfg-reload').onclick = function(){ cfgOp('reload'); };\ndocument.getElementById('cfg-restore').onclick = function(){ cfgOp('restore'); };\ndocument.getElementById('cfg-file').addEventListener('change', function(ev){\n  var f = ev.target.files[0];\n  if(!f) return;\n  if(f.size > 8000){ cfgMsg('文件需小于8KB'); return; }\n  cfgMsg('请稍候');\n  f.text().then(function(t){\n    return fetch('/api/config_upload', {method:'POST', body:t});\n  }).then(function(r){ return r.json(); }).then(function(r){\n    cfgMsg(r.ok ? '上传并加载成功' : (r.err||'失败'));\n    if(r.ok){ loadStatus(true); }\n  }).catch(function(){ cfgMsg('上传失败'); });\n});\n</script>\r\n</body>\r\n</html>\r\n";
+static const char WEB_PAGE[] = "<!DOCTYPE html>\r\n<html lang=\"zh\">\r\n<head>\r\n<meta charset=\"utf-8\">\r\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\r\n<title>串口记录仪</title>\r\n<style>\r\nbody{font:16px/1.45 -apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;margin:0;background:#0f1419;color:#e8eef5}\r\nheader,main{padding:12px}\r\nh1{font-size:20px;margin:0 0 6px}\r\nh2{font-size:16px;margin:0 0 8px}\r\n.card{background:#1b2430;border-radius:10px;padding:10px;margin:10px 0}\r\nlabel{display:block;margin:6px 0;color:#b7c3d1}\r\nselect,input,button{font-size:16px}\r\ninput{width:64px;padding:6px;border-radius:6px;border:0}\r\nbutton{background:#2f6fed;color:#fff;border:0;border-radius:8px;padding:12px 14px;margin:6px 6px 0 0}\r\n.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}\r\n.muted{color:#9aa8b8}\r\n.line{display:flex;align-items:center;gap:8px;margin:8px 0}\r\n.item{flex:1;display:block;color:#d7e6ff;text-decoration:none;background:#243044;border-radius:8px;padding:12px}\r\n.pick{width:22px;height:22px}\r\n#crumb a{color:#8ec5ff;margin-right:4px}\r\n.msg{min-height:1.2em;color:#ffd27a}\r\n#live{height:240px;overflow:auto;background:#0b0f14;padding:8px;white-space:pre-wrap;font:13px/1.35 ui-monospace,monospace}\n#cfg-file{width:auto;padding:0;background:none;border-radius:0}\r\n</style>\r\n</head>\r\n<body>\r\n<header>\r\n<h1>串口记录仪</h1>\r\n<div id=\"info\" class=\"muted\">正在读取...</div>\r\n</header>\r\n<main>\r\n<div id=\"ports\"></div>\r\n<div class=\"card\">\r\n<h2>串口透传</h2>\r\n<div class=\"muted\">WiFi TCP：用电脑 TCP 工具连接 192.168.4.1 对应端口即可双向透传。蓝牙为 BLE UART(NUS)，手机需用 BLE 调试工具(如 nRF Connect) 连接。</div>\r\n<div id=\"bridge\"></div>\r\n<div id=\"bridge-msg\" class=\"msg\"></div>\r\n</div>\r\n<div class=\"card\">\r\n<h2>实时数据</h2>\r\n<div class=\"row\">\r\n<label><input id=\"lv0\" class=\"pick\" type=\"checkbox\"> U0</label>\r\n<label><input id=\"lv1\" class=\"pick\" type=\"checkbox\" checked> J2</label>\r\n<label><input id=\"lv2\" class=\"pick\" type=\"checkbox\" checked> J3</label>\r\n<button type=\"button\" id=\"lv-clear\">清空</button>\r\n</div>\r\n<pre id=\"live\"></pre>\r\n</div>\r\n<div class=\"card\">\r\n<h2>校时</h2>\r\n<div class=\"row\">\r\n<label>年 <input id=\"yy\" inputmode=\"numeric\"></label>\r\n<label>月 <input id=\"mo\" inputmode=\"numeric\"></label>\r\n<label>日 <input id=\"dd\" inputmode=\"numeric\"></label>\r\n</div>\r\n<div class=\"row\">\r\n<label>时 <input id=\"hh\" inputmode=\"numeric\"></label>\r\n<label>分 <input id=\"mm\" inputmode=\"numeric\"></label>\r\n<label>秒 <input id=\"ss\" inputmode=\"numeric\"></label>\r\n</div>\r\n<button type=\"button\" id=\"btn-time\">校时</button>\r\n<button type=\"button\" id=\"btn-phone\">用手机时间</button>\r\n<div id=\"time-msg\" class=\"msg\"></div>\r\n</div>\r\n<div class=\"card\">\r\n<h2>日志文件</h2>\r\n<div id=\"crumb\" class=\"muted\"></div>\r\n<button type=\"button\" id=\"btn-all\">全选</button>\r\n<button type=\"button\" id=\"btn-zip\">下载选中</button>\r\n<button type=\"button\" id=\"btn-zipall\">下载全部</button>\r\n<div id=\"files\"></div>\r\n<div id=\"file-msg\" class=\"msg\"></div>\r\n</div>\r\n<div class=\"card\">\r\n<h2>配置管理</h2>\r\n<div class=\"muted\">config.json 位于TF卡根目录：屏幕或本页修改参数都会自动写入，每次覆盖自动备份 config.json.bak。WiFi名称/密码与透传开关经文件加载后在下次启动生效。</div>\r\n<div class=\"row\">\r\n<button type=\"button\" id=\"cfg-download\">下载config.json</button>\r\n<button type=\"button\" id=\"cfg-export\">立即导出</button>\r\n<button type=\"button\" id=\"cfg-reload\">从卡重载</button>\r\n<button type=\"button\" id=\"cfg-restore\">恢复备份</button>\r\n</div>\r\n<div class=\"row\">\r\n<label>上传config.json <input id=\"cfg-file\" type=\"file\" accept=\".json,application/json\"></label>\r\n</div>\r\n<div id=\"cfg-msg\" class=\"msg\"></div>\r\n</div>\r\n<div class=\"card\">\r\n<h2>日志存储</h2>\r\n<div class=\"muted\">存储占用率达到阈值后，记录仪按通道独立删除各自目录下最早的日志文件，绝不跨通道删除；占用回落到阈值以下即停止清理。</div>\r\n<div class=\"row\">\r\n<label>阈值% <input id=\"st-limit\" inputmode=\"numeric\"></label>\r\n<button type=\"button\" id=\"st-save\">保存阈值</button>\r\n<span class=\"muted\" id=\"st-info\"></span>\r\n</div>\r\n<div class=\"row\">\r\n<button type=\"button\" data-clear=\"0\">清理U0最早</button>\r\n<button type=\"button\" data-clear=\"1\">清理J2最早</button>\r\n<button type=\"button\" data-clear=\"2\">清理J3最早</button>\r\n<button type=\"button\" data-clear=\"-1\">每通道各清200个</button>\r\n</div>\r\n<div id=\"st-msg\" class=\"msg\"></div>\r\n</div>\r\n<div class=\"card\">\r\n<h2>固件升级 OTA</h2>\r\n<div class=\"muted\">固件先上传到TF卡暂存，校验通过后安装到备用分区并重启。新固件启动后有30秒健康确认窗口，超时未确认或主动回滚都会退回旧版本；断电时可从上一次成功槽位继续启动。</div>\r\n<div id=\"ota-info\" class=\"muted\">读取中...</div>\r\n<div class=\"row\">\r\n<label>固件 .bin <input id=\"ota-file\" type=\"file\" accept=\".bin,application/octet-stream\"></label>\r\n</div>\r\n<div class=\"row\">\r\n<button type=\"button\" id=\"ota-upload\">上传固件</button>\r\n<button type=\"button\" id=\"ota-apply\">安装并重启</button>\r\n<button type=\"button\" id=\"ota-confirm\">确认当前版本</button>\r\n<button type=\"button\" id=\"ota-rollback\">回滚旧版本</button>\r\n</div>\r\n<div id=\"ota-msg\" class=\"msg\"></div>\r\n</div>\r\n<div class=\"card\">\r\n<h2>Modbus 模拟</h2>\r\n<div class=\"muted\">模拟器复用记录仪的串口收发队列：从站自动应答主站请求，主站按规则轮询/写入，不会额外占用串口。同一通道不能同时做主站和从站。</div>\r\n<div id=\"mbs\" class=\"muted\">读取中...</div>\r\n<h2 style=\"margin-top:12px\">RTU 从站</h2>\r\n<div class=\"row\">\r\n<label>启用 <select id=\"mb-se\"><option value=\"0\">否</option><option value=\"1\">是</option></select></label>\r\n<label>通道 <select id=\"mb-sp\"><option value=\"0\">U0</option><option value=\"1\">J2</option><option value=\"2\">J3</option></select></label>\r\n<label>从站地址 <input id=\"mb-sa\" inputmode=\"numeric\"></label>\r\n</div>\r\n<div class=\"row\">\r\n<label>线圈起/数 <input id=\"mb-cs\" style=\"width:56px\"><input id=\"mb-cc\" style=\"width:48px\"></label>\r\n<label>离散起/数 <input id=\"mb-ds\" style=\"width:56px\"><input id=\"mb-dc\" style=\"width:48px\"></label>\r\n</div>\r\n<div class=\"row\">\r\n<label>保持起/数 <input id=\"mb-hs\" style=\"width:56px\"><input id=\"mb-hc\" style=\"width:48px\"></label>\r\n<label>输入起/数 <input id=\"mb-is\" style=\"width:56px\"><input id=\"mb-ic\" style=\"width:48px\"></label>\r\n<button type=\"button\" id=\"mb-save\">保存从站</button>\r\n</div>\r\n<h2 style=\"margin-top:12px\">RTU 主站规则</h2>\r\n<div id=\"mb-rules\"></div>\r\n<div class=\"row\">\r\n<button type=\"button\" id=\"mb-add\">新增规则</button>\r\n<button type=\"button\" id=\"mb-runall\">执行全部</button>\r\n</div>\r\n<h2 style=\"margin-top:12px\">寄存器 / 线圈值</h2>\r\n<div class=\"row\">\r\n<label>类型 <select id=\"mb-rt\"><option value=\"hold\">保持寄存器</option><option value=\"input\">输入寄存器</option><option value=\"coil\">线圈</option><option value=\"disc\">离散输入</option></select></label>\r\n<label>地址 <input id=\"mb-ra\" inputmode=\"numeric\"></label>\r\n<label>值 <input id=\"mb-rv\" inputmode=\"numeric\"></label>\r\n<button type=\"button\" id=\"mb-read\">读</button>\r\n<button type=\"button\" id=\"mb-write\">写</button>\r\n</div>\r\n<div id=\"mb-msg\" class=\"msg\"></div>\r\n</div>\r\n</main>\r\n<script>\r\nconst names=[\"U0 板载\",\"J2\",\"J3\"];\r\nconst bauds=[115200,9600,19200,38400,57600,230400,460800,921600,4800,2400,1200];\r\nconst protos=[[\"off\",\"不解析\"],[\"auto\",\"自动识别\"],[\"modbus_rtu\",\"Modbus RTU\"],[\"modbus_ascii\",\"Modbus ASCII\"],[\"dlt645\",\"DL/T645\"],[\"cjt188\",\"CJ/T188\"],[\"ascii\",\"ASCII 文本\"]];\r\nlet cur=\"/sdcard\";\r\nlet ports=[];\r\nfunction opts(list,val){\r\n  return list.map(function(v){\r\n    return '<option value=\"'+v+'\"'+(String(v)===String(val)?' selected':'')+'>'+v+'</option>';\r\n  }).join('');\r\n}\r\nfunction protoOpts(val){\r\n  return protos.map(function(p){\r\n    return '<option value=\"'+p[0]+'\"'+(p[0]===val?' selected':'')+'>'+p[1]+'</option>';\r\n  }).join('');\r\n}\r\nfunction show(id,text){var el=document.getElementById(id); if(el) el.textContent=text||'';}\r\nfunction fillTime(text){\r\n  var m=/(\\d{4})-(\\d{2})-(\\d{2}) (\\d{2}):(\\d{2}):(\\d{2})/.exec(text||'');\r\n  if(!m) return;\r\n  document.getElementById('yy').value=m[1];\r\n  document.getElementById('mo').value=String(Number(m[2]));\r\n  document.getElementById('dd').value=String(Number(m[3]));\r\n  document.getElementById('hh').value=String(Number(m[4]));\r\n  document.getElementById('mm').value=String(Number(m[5]));\r\n  document.getElementById('ss').value=String(Number(m[6]));\r\n}\r\nfunction renderPorts(){\r\n  document.getElementById('ports').innerHTML=ports.map(function(p,i){\r\n    var st=p.open?('已打开 TX '+p.tx+' RX '+p.rx):(p.err?('失败 '+p.err):'已关闭');\r\n    return '<div class=\"card\" id=\"p'+i+'\"><b>'+names[i]+'</b> <span class=\"st\">'+st+'</span>'\r\n      +'<label>波特率 <select class=\"baud\">'+opts(bauds,p.baud)+'</select></label>'\r\n      +'<div class=\"row\"><label>数据位 <select class=\"bits\">'+opts([8,7,6,5],p.bits)+'</select></label>'\r\n      +'<label>停止位 <select class=\"stop\">'+opts(['1','1.5','2'],p.stop)+'</select></label>'\r\n      +'<label>校验 <select class=\"par\">'+opts(['N','E','O'],p.parity)+'</select></label></div>'\n      +'<label>日志解析 <select class=\"parse\">'+protoOpts(p.parse)+'</select></label>'\r\n      +'<button type=\"button\" data-act=\"toggle\" data-i=\"'+i+'\">'+(p.on?'关闭串口':'打开串口')+'</button>'\r\n      +'<button type=\"button\" data-act=\"apply\" data-i=\"'+i+'\">应用参数</button>'\r\n      +'<div class=\"msg\" id=\"m'+i+'\"></div></div>';\r\n  }).join('');\r\n}\r\nasync function loadStatus(fill){\r\n  try{\r\n    const s=await (await fetch('/api/status')).json();\r\n    show('info', s.time+'  '+(s.sd?('SD '+s.free_mb+' MB'):'无卡')+'  '+s.ssid);\r\n    if(fill){\r\n      ports=s.ports;\r\n      renderPorts();\r\n      fillTime(s.time);\r\n    }else{\r\n      s.ports.forEach(function(p,i){\r\n        ports[i].open=p.open; ports[i].tx=p.tx; ports[i].rx=p.rx; ports[i].err=p.err; ports[i].on=p.on;\r\n        var el=document.querySelector('#p'+i+' .st');\r\n        if(el) el.textContent=p.open?('已打开 TX '+p.tx+' RX '+p.rx):(p.err?('失败 '+p.err):'已关闭');\r\n        var btn=document.querySelector('#p'+i+' button[data-act=\"toggle\"]');\r\n        if(btn) btn.textContent=p.on?'关闭串口':'打开串口';\r\n      });\r\n    }\r\n  }catch(e){\r\n    show('info','读取失败');\r\n  }\r\n}\r\nfunction cardParams(i, on){\r\n  var card=document.getElementById('p'+i);\r\n  return new URLSearchParams({\r\n    index:String(i),\r\n    baud:card.querySelector('.baud').value,\r\n    bits:card.querySelector('.bits').value,\r\n    stop:card.querySelector('.stop').value,\r\n    parity:card.querySelector('.par').value,\r\n    parse:card.querySelector('.parse').value,\r\n    on:on\r\n  });\r\n}\r\nasync function savePort(i, on){\r\n  show('m'+i,'请稍候');\r\n  try{\r\n    const r=await fetch('/api/port?'+cardParams(i,on).toString());\r\n    const j=await r.json();\r\n    show('m'+i, j.ok?(on==='1'?'已打开':'已关闭'):(j.err||'失败'));\r\n    if(j.ok){ ports[i].on=(on==='1'); }\r\n    await loadStatus(false);\r\n  }catch(e){\r\n    show('m'+i,'无响应');\r\n  }\r\n}\r\ndocument.getElementById('ports').addEventListener('click', function(ev){\r\n  var node=ev.target;\r\n  while(node && node.tagName!=='BUTTON') node=node.parentNode;\r\n  if(!node || !node.dataset) return;\r\n  var i=Number(node.dataset.i);\r\n  if(node.dataset.act==='toggle'){\r\n    savePort(i, ports[i] && ports[i].on ? '0' : '1');\r\n  }else if(node.dataset.act==='apply'){\r\n    savePort(i, (ports[i] && ports[i].on) ? '1' : '0');\r\n  }\r\n});\r\ndocument.getElementById('btn-time').addEventListener('click', async function(){\r\n  show('time-msg','请稍候');\r\n  var body=new URLSearchParams({\r\n    y:document.getElementById('yy').value,\r\n    mo:document.getElementById('mo').value,\r\n    d:document.getElementById('dd').value,\r\n    h:document.getElementById('hh').value,\r\n    mi:document.getElementById('mm').value,\r\n    s:document.getElementById('ss').value\r\n  });\r\n  try{\r\n    const r=await fetch('/api/time?'+body.toString());\r\n    const j=await r.json();\r\n    show('time-msg', j.ok?('校时成功 '+j.time):(j.err||'日期无效'));\r\n    if(j.ok) show('info', j.time);\r\n  }catch(e){\r\n    show('time-msg','无响应');\r\n  }\r\n});\r\nfunction safeDir(path){\r\n  if(!path || path.indexOf('/sdcard')!==0 || path.indexOf('..')>=0) return '/sdcard';\r\n  return path;\r\n}\r\nfunction upPath(path){\r\n  path=safeDir(path);\r\n  if(path==='/sdcard') return '/sdcard';\r\n  var i=path.lastIndexOf('/');\r\n  return i<=7?'/sdcard':path.slice(0,i);\r\n}\r\nfunction renderCrumb(path){\r\n  var box=document.getElementById('crumb');\r\n  box.innerHTML='';\r\n  var acc='';\r\n  path.split('/').forEach(function(part){\r\n    if(!part) return;\r\n    acc+='/'+part;\r\n    if(box.childNodes.length){\r\n      var sep=document.createElement('span');\r\n      sep.textContent=' / ';\r\n      box.appendChild(sep);\r\n    }\r\n    var a=document.createElement('a');\r\n    a.textContent=part;\r\n    a.href='/?dir='+encodeURIComponent(acc);\r\n    a.setAttribute('data-dir','1');\r\n    a.setAttribute('data-path',acc);\r\n    box.appendChild(a);\r\n  });\r\n}\r\nasync function loadFiles(path){\r\n  cur=safeDir(path);\r\n  show('file-msg','');\r\n  try{\r\n    const r=await fetch('/api/files?path='+encodeURIComponent(cur));\r\n    const s=await r.json();\r\n    if(s.err){ show('file-msg', s.err); }\r\n    var shown=safeDir(s.path||cur);\r\n    cur=shown;\r\n    renderCrumb(shown);\r\n    var box=document.getElementById('files');\r\n    box.innerHTML='';\r\n    if(shown!=='/sdcard'){\r\n      var back=document.createElement('a');\r\n      back.className='item';\r\n      back.textContent='.. 返回';\r\n      back.href='/?dir='+encodeURIComponent(upPath(shown));\r\n      back.setAttribute('data-dir','1');\r\n      back.setAttribute('data-path', upPath(shown));\r\n      var line0=document.createElement('div');\r\n      line0.className='line';\r\n      line0.appendChild(back);\r\n      box.appendChild(line0);\r\n    }\r\n    (s.items||[]).forEach(function(it){\r\n      var full=shown+'/'+it.name;\r\n      var line=document.createElement('div');\r\n      line.className='line';\r\n      if(!it.dir){\r\n        var ck=document.createElement('input');\r\n        ck.type='checkbox';\r\n        ck.className='pick';\r\n        ck.setAttribute('data-name', it.name);\r\n        line.appendChild(ck);\r\n      }\r\n      var a=document.createElement('a');\r\n      a.className='item';\r\n      if(it.dir){\r\n        a.textContent=it.name+'/';\r\n        a.href='/?dir='+encodeURIComponent(full);\r\n        a.setAttribute('data-dir','1');\r\n        a.setAttribute('data-path', full);\r\n      }else{\r\n        a.textContent=it.name+'  '+it.size;\r\n        a.href='/dl?path='+encodeURIComponent(full);\r\n      }\r\n      line.appendChild(a);\r\n      box.appendChild(line);\r\n    });\r\n    if(!(s.items||[]).length){\r\n      var empty=document.createElement('div');\r\n      empty.className='muted';\r\n      empty.textContent='空';\r\n      box.appendChild(empty);\r\n    }\r\n  }catch(e){\r\n    show('file-msg','目录读取失败');\r\n  }\r\n}\r\nfunction onDirClick(ev){\r\n  var node=ev.target;\r\n  while(node && node.tagName!=='A') node=node.parentNode;\r\n  if(!node || node.getAttribute('data-dir')!=='1') return;\r\n  ev.preventDefault();\r\n  loadFiles(node.getAttribute('data-path'));\r\n}\r\ndocument.getElementById('crumb').addEventListener('click', onDirClick);\r\ndocument.getElementById('files').addEventListener('click', onDirClick);\r\ndocument.getElementById('btn-all').addEventListener('click', function(){\r\n  var boxes=document.querySelectorAll('#files .pick');\r\n  var mark=false;\r\n  for(var i=0;i<boxes.length;i++){ if(!boxes[i].checked) mark=true; }\r\n  for(var j=0;j<boxes.length;j++) boxes[j].checked=mark;\r\n});\r\nfunction selectedNames(){\r\n  var names=[];\r\n  var boxes=document.querySelectorAll('#files .pick');\r\n  for(var i=0;i<boxes.length;i++){\r\n    if(boxes[i].checked) names.push(boxes[i].getAttribute('data-name'));\r\n  }\r\n  return {names:names, total:boxes.length};\r\n}\r\ndocument.getElementById('btn-zip').addEventListener('click', function(){\r\n  var sel=selectedNames();\r\n  if(!sel.names.length){ show('file-msg','请选择文件'); return; }\r\n  if(sel.names.length===sel.total){\r\n    window.location.href='/api/zip?dir='+encodeURIComponent(cur)+'&all=1';\r\n    return;\r\n  }\r\n  var q='/api/zip?dir='+encodeURIComponent(cur)+'&names='+encodeURIComponent(sel.names.join('|'));\r\n  if(q.length>1500){ show('file-msg','选中太多,请用下载全部'); return; }\r\n  window.location.href=q;\r\n});\r\ndocument.getElementById('btn-zipall').addEventListener('click', function(){\r\n  window.location.href='/api/zip?dir='+encodeURIComponent(cur)+'&all=1';\r\n});\r\ndocument.getElementById('btn-phone').addEventListener('click', async function(){\r\n  var d=new Date();\r\n  document.getElementById('yy').value=d.getFullYear();\r\n  document.getElementById('mo').value=d.getMonth()+1;\r\n  document.getElementById('dd').value=d.getDate();\r\n  document.getElementById('hh').value=d.getHours();\r\n  document.getElementById('mm').value=d.getMinutes();\r\n  document.getElementById('ss').value=d.getSeconds();\r\n  show('time-msg','请稍候');\r\n  var body=new URLSearchParams({\r\n    y:d.getFullYear(), mo:d.getMonth()+1, d:d.getDate(),\r\n    h:d.getHours(), mi:d.getMinutes(), s:d.getSeconds()\r\n  });\r\n  try{\r\n    const r=await fetch('/api/time?'+body.toString());\r\n    const j=await r.json();\r\n    show('time-msg', j.ok?('校时成功 '+j.time):(j.err||'日期无效'));\r\n    if(j.ok) show('info', j.time);\r\n  }catch(e){\r\n    show('time-msg','无响应');\r\n  }\r\n});\r\n\r\n\r\nlet liveCursor=[0,0,0];\r\ndocument.getElementById('lv-clear').addEventListener('click', function(){\r\n  document.getElementById('live').textContent='';\r\n  liveCursor=[0,0,0];\r\n});\r\nasync function pollLive(){\r\n  var q=[];\r\n  for(var i=0;i<3;i++){\r\n    var box=document.getElementById('lv'+i);\r\n    if(box && box.checked) q.push(i+'='+liveCursor[i]);\r\n  }\r\n  if(!q.length) return;\r\n  try{\r\n    const s=await (await fetch('/api/live?'+q.join('&'))).json();\r\n    var view=document.getElementById('live');\r\n    var stick=view.scrollTop+view.clientHeight>=view.scrollHeight-24;\r\n    (s.ports||[]).forEach(function(p){\r\n      liveCursor[p.i]=p.next;\r\n      if(p.text) view.textContent+=p.text;\r\n    });\r\n    if(view.textContent.length>24000) view.textContent=view.textContent.slice(-14000);\r\n    if(stick) view.scrollTop=view.scrollHeight;\r\n  }catch(e){}\r\n}\r\n\r\nloadStatus(true);\r\nvar startDir='/sdcard';\r\ntry{ var qs=new URLSearchParams(location.search); startDir=safeDir(qs.get('dir')||'/sdcard'); }catch(e){}\r\nloadFiles(startDir);\r\nsetInterval(function(){loadStatus(false);},2000);\r\nsetInterval(pollLive,500);\r\n\nfunction apiGet(url){ return fetch(url).then(function(r){return r.json();}); }\nfunction renderBridge(){\n  apiGet('/api/bridge').then(function(b){\n    var labels=['U0','J2','J3'];\n    var rows=b.tcp.map(function(t,i){\n      return '<div class=\"line\"><b style=\"width:34px\">'+labels[i]+'</b>'\n        +'<label>TCP端口 <input class=\"bport\" style=\"width:90px\" value=\"'+t.port+'\"></label>'\n        +'<button type=\"button\" class=\"btcp\" data-i=\"'+i+'\">'+(t.on?('停止(客户端'+t.clients+')'):'开启TCP')+'</button>'\n        +'<span class=\"muted\">收'+t.rx+' 发'+t.tx+'</span></div>';\n    }).join('');\n    var ble=b.ble;\n    rows+='<div class=\"line\"><b style=\"width:34px\">BLE</b>'\n      +'<label>绑定 <select id=\"ble-port\"><option value=\"0\">U0</option><option value=\"1\"'+(ble.port===1?' selected':'')+'>J2</option><option value=\"2\"'+(ble.port===2?' selected':'')+'>J3</option></select></label>'\n      +'<label>名称 <input id=\"ble-name\" style=\"width:120px\" value=\"'+ble.name+'\"></label>'\n      +'<button type=\"button\" id=\"b-ble\">'+(ble.on?(ble.connected?'已连接,停止':'广播中,停止'):'开启BLE')+'</button>'\n      +'<span class=\"muted\">收'+ble.rx+' 发'+ble.tx+'</span></div>';\n    document.getElementById('bridge').innerHTML=rows;\n    Array.prototype.forEach.call(document.querySelectorAll('.btcp'),function(btn){\n      btn.onclick=function(){\n        var i=btn.getAttribute('data-i');\n        var on=btn.textContent.indexOf('开启')===0;\n        var port=btn.parentElement.querySelector('.bport').value;\n        apiGet('/api/bridge_tcp?index='+i+'&on='+(on?1:0)+'&port='+port).then(function(r){\n          show('bridge-msg',r.ok?'已更新':('失败 '+(r.err||''))); renderBridge();\n        });\n      };\n    });\n    document.getElementById('b-ble').onclick=function(){\n      var on=document.getElementById('b-ble').textContent.indexOf('开启')===0;\n      var p=document.getElementById('ble-port').value;\n      var nm=encodeURIComponent(document.getElementById('ble-name').value);\n      apiGet('/api/bridge_ble?index='+p+'&on='+(on?1:0)+'&name='+nm).then(function(r){\n        show('bridge-msg',r.ok?'已更新':('失败 '+(r.err||''))); renderBridge();\n      });\n    };\n  });\n}\n\nsetInterval(renderBridge, 3000);\n\n// --- configuration management ---\nfunction cfgMsg(text){ show('cfg-msg', text); }\ndocument.getElementById('cfg-download').onclick = function(){\n  window.location.href='/dl?path='+encodeURIComponent('/sdcard/config.json');\n};\nfunction cfgOp(op, done){\n  cfgMsg('请稍候');\n  apiGet('/api/config?op='+op).then(function(r){\n    cfgMsg(r.ok ? (r.msg||'完成') : (r.err||'失败'));\n    if(r.ok) { loadStatus(true); }\n    if(done) done(r);\n  }).catch(function(){ cfgMsg('无响应'); });\n}\ndocument.getElementById('cfg-export').onclick = function(){ cfgOp('export'); };\ndocument.getElementById('cfg-reload').onclick = function(){ cfgOp('reload'); };\ndocument.getElementById('cfg-restore').onclick = function(){ cfgOp('restore'); };\ndocument.getElementById('cfg-file').addEventListener('change', function(ev){\n  var f = ev.target.files[0];\n  if(!f) return;\n  if(f.size > 8000){ cfgMsg('文件需小于8KB'); return; }\n  cfgMsg('请稍候');\n  f.text().then(function(t){\n    return fetch('/api/config_upload', {method:'POST', body:t});\n  }).then(function(r){ return r.json(); }).then(function(r){\n    cfgMsg(r.ok ? '上传并加载成功' : (r.err||'失败'));\n    if(r.ok){ loadStatus(true); }\n  }).catch(function(){ cfgMsg('上传失败'); });\n});\n\n// --- storage retention ---\nfunction renderStorage(){\n  apiGet('/api/storage').then(function(s){\n    document.getElementById('st-limit').value=s.limit;\n    document.getElementById('st-info').textContent='总 '+(s.total_mb||0)+' MB / 可用 '+(s.free_mb||0)\n      +' MB，累计清理 '+s.cleaned+' 个文件';\n  }).catch(function(){ show('st-info','读取失败'); });\n}\ndocument.getElementById('st-save').onclick=function(){\n  var v=Number(document.getElementById('st-limit').value);\n  if(!(v>=1&&v<=99)){ show('st-msg','阈值需在 1-99 之间'); return; }\n  apiGet('/api/storage?limit='+v).then(function(r){\n    show('st-msg', r.ok?('已保存阈值 '+r.limit+'%'):(r.err||'失败'));\n    renderStorage();\n  }).catch(function(){ show('st-msg','无响应'); });\n};\nArray.prototype.forEach.call(document.querySelectorAll('[data-clear]'), function(btn){\n  btn.onclick=function(){\n    var p=btn.getAttribute('data-clear');\n    if(!confirm('确认清理最早日志？仅删除对应通道目录下的文件。')) return;\n    apiGet('/api/logs_clear?port='+p).then(function(r){\n      show('st-msg', r.ok?'已提交清理，稍候生效':(r.err||'失败'));\n    }).catch(function(){ show('st-msg','无响应'); });\n  };\n});\n\n// --- OTA ---\nconst otaPhase=['空闲','下载中','待安装','安装中','切换待重启','失败','待确认','已回滚'];\nfunction renderOta(){\n  apiGet('/api/ota').then(function(o){\n    var t='运行槽 '+o.slot+(o.next>=0?('，备用槽 '+o.next):'')+'，版本 '+(o.version||'-')\n      +'，状态 '+(otaPhase[o.phase]||o.phase);\n    if(o.available) t+='，暂存镜像 '+Math.floor(o.total/1024)+' KB';\n    if(o.pending) t+='，新固件待确认';\n    if(o.msg) t+='，'+o.msg;\n    document.getElementById('ota-info').textContent=t;\n  }).catch(function(){ show('ota-info','读取失败'); });\n}\ndocument.getElementById('ota-upload').onclick=function(){\n  var f=document.getElementById('ota-file').files[0];\n  if(!f){ show('ota-msg','请选择固件文件'); return; }\n  if(f.size<131072){ show('ota-msg','固件过小，需不小于 128KB'); return; }\n  show('ota-msg','上传中 0%');\n  var xhr=new XMLHttpRequest();\n  xhr.open('POST','/api/ota_upload');\n  xhr.upload.onprogress=function(e){\n    if(e.lengthComputable) show('ota-msg','上传中 '+Math.round(e.loaded*100/e.total)+'%');\n  };\n  xhr.onload=function(){\n    var r={};\n    try{ r=JSON.parse(xhr.responseText); }catch(e){}\n    show('ota-msg', r.ok?'镜像已暂存，可点击安装':(r.err||('失败 '+xhr.status)));\n    renderOta();\n  };\n  xhr.onerror=function(){ show('ota-msg','上传失败'); };\n  xhr.send(f);\n};\ndocument.getElementById('ota-apply').onclick=function(){\n  if(!confirm('确认安装暂存固件并立即重启？')) return;\n  apiGet('/api/ota_action?do=apply').then(function(r){\n    show('ota-msg', r.ok?r.msg:(r.err||'失败'));\n  }).catch(function(){ show('ota-msg','设备正在重启'); });\n};\ndocument.getElementById('ota-confirm').onclick=function(){\n  apiGet('/api/ota_action?do=confirm').then(function(r){\n    show('ota-msg', r.ok?r.msg:(r.err||'失败'));\n    renderOta();\n  }).catch(function(){ show('ota-msg','无响应'); });\n};\ndocument.getElementById('ota-rollback').onclick=function(){\n  if(!confirm('确认回滚到旧版本并重启？')) return;\n  apiGet('/api/ota_action?do=rollback').then(function(r){\n    show('ota-msg', r.ok?r.msg:(r.err||'失败'));\n  }).catch(function(){ show('ota-msg','设备正在重启'); });\n};\n\n// --- Modbus simulator ---\nlet mbState={slave:{}, rules:[]};\nfunction mbMsg(r){\n  if(!r || !r.ok){ show('mb-msg', (r&&r.err)||'失败'); return; }\n  renderSim(r);\n}\nfunction renderSim(s){\n  mbState=s;\n  var sl=s.slave;\n  document.getElementById('mb-se').value=sl.en?'1':'0';\n  document.getElementById('mb-sp').value=sl.port;\n  document.getElementById('mb-sa').value=sl.station;\n  document.getElementById('mb-cs').value=sl.coil[0];\n  document.getElementById('mb-cc').value=sl.coil[1];\n  document.getElementById('mb-ds').value=sl.disc[0];\n  document.getElementById('mb-dc').value=sl.disc[1];\n  document.getElementById('mb-hs').value=sl.hold[0];\n  document.getElementById('mb-hc').value=sl.hold[1];\n  document.getElementById('mb-is').value=sl.input[0];\n  document.getElementById('mb-ic').value=sl.input[1];\n  var st=s.stats||{};\n  show('mbs','从站请求 '+st.sreq+' / 应答 '+st.srsp+'，主站请求 '+st.req+' / 应答 '+st.rsp\n    +' / 超时 '+st.to+' / 异常 '+st.err);\n  renderRules(s.rules||[]);\n}\nfunction ruleStatus(r){\n  if(r.status===0) return '正常';\n  if(r.status===-1) return '超时';\n  if(r.status===-2) return '异常应答';\n  if(r.status===-3) return '通道未打开';\n  return '未执行';\n}\nfunction renderRules(rules){\n  var html=rules.map(function(r,i){\n    return '<div class=\"row\" style=\"border-top:1px solid #243044;padding-top:6px\" data-rule=\"'+i+'\">'\n      +'<b>#'+i+'</b>'\n      +'<label>启用 <select class=\"en\">'+opts([0,1],r.en)+'</select></label>'\n      +'<label>通道 <select class=\"port\">'+opts([0,1,2],r.port)+'</select></label>'\n      +'<label>从站 <input class=\"slave\" style=\"width:46px\" value=\"'+r.slave+'\"></label>'\n      +'<label>功能码 <select class=\"fc\">'+opts([1,2,3,4,5,6,15,16],r.fc)+'</select></label>'\n      +'<label>起始 <input class=\"start\" style=\"width:56px\" value=\"'+r.start+'\"></label>'\n      +'<label>数量 <input class=\"qty\" style=\"width:46px\" value=\"'+r.qty+'\"></label>'\n      +'<label>值 <input class=\"values\" style=\"width:96px\" value=\"'+(r.values||[]).join(',')+'\"></label>'\n      +'<label>周期ms <input class=\"period\" style=\"width:64px\" value=\"'+r.period+'\"></label>'\n      +'<label>次数 <input class=\"repeat\" style=\"width:46px\" value=\"'+r.repeat+'\"></label>'\n      +'<button type=\"button\" class=\"save\">保存</button>'\n      +'<button type=\"button\" class=\"run\">执行</button>'\n      +'<button type=\"button\" class=\"del\">删除</button>'\n      +'<span class=\"muted\">'+ruleStatus(r)+' 请求'+r.req+' 应答'+r.rsp+' 超时'+r.to+' 异常'+r.err\n      +((r.last&&r.last.length)?(' 值['+r.last.join(',')+']'):'')+'</span></div>';\n  }).join('');\n  document.getElementById('mb-rules').innerHTML=html || '<div class=\"muted\">暂无规则</div>';\n}\ndocument.getElementById('mb-save').onclick=function(){\n  var qs=[['en','mb-se'],['port','mb-sp'],['station','mb-sa'],['cs','mb-cs'],['cc','mb-cc'],\n          ['ds','mb-ds'],['dc','mb-dc'],['hs','mb-hs'],['hc','mb-hc'],['is','mb-is'],['ic','mb-ic']];\n  var q='/api/mbsim_cfg?action=slave';\n  qs.forEach(function(kv){ q+='&'+kv[0]+'='+encodeURIComponent(document.getElementById(kv[1]).value); });\n  apiGet(q).then(mbMsg).catch(function(){ show('mb-msg','无响应'); });\n};\ndocument.getElementById('mb-rules').addEventListener('click', function(ev){\n  var btn=ev.target;\n  if(btn.tagName!=='BUTTON') return;\n  var row=btn.parentElement;\n  var idx=row.getAttribute('data-rule');\n  if(btn.className==='del'){\n    apiGet('/api/mbsim_cfg?action=del&idx='+idx).then(mbMsg).catch(function(){ show('mb-msg','无响应'); });\n    return;\n  }\n  if(btn.className==='run'){\n    apiGet('/api/mbsim_cfg?action=run&idx='+idx).then(mbMsg).catch(function(){ show('mb-msg','无响应'); });\n    return;\n  }\n  var q='/api/mbsim_cfg?action=rule&idx='+idx\n    +'&en='+row.querySelector('.en').value\n    +'&port='+row.querySelector('.port').value\n    +'&slave='+row.querySelector('.slave').value\n    +'&fc='+row.querySelector('.fc').value\n    +'&start='+row.querySelector('.start').value\n    +'&qty='+row.querySelector('.qty').value\n    +'&period='+row.querySelector('.period').value\n    +'&repeat='+row.querySelector('.repeat').value;\n  var vals=row.querySelector('.values').value.trim();\n  if(vals) q+='&values='+encodeURIComponent(vals);\n  apiGet(q).then(mbMsg).catch(function(){ show('mb-msg','无响应'); });\n});\ndocument.getElementById('mb-add').onclick=function(){\n  var idx=(mbState.rules||[]).length;\n  if(idx>=8){ show('mb-msg','最多 8 条规则'); return; }\n  apiGet('/api/mbsim_cfg?action=rule&idx='+idx).then(mbMsg).catch(function(){ show('mb-msg','无响应'); });\n};\ndocument.getElementById('mb-runall').onclick=function(){\n  apiGet('/api/mbsim_cfg?action=run&idx=-1').then(mbMsg).catch(function(){ show('mb-msg','无响应'); });\n};\nfunction mbReg(write){\n  var type=document.getElementById('mb-rt').value;\n  var addr=document.getElementById('mb-ra').value.trim();\n  if(!addr){ show('mb-msg','请输入地址'); return; }\n  var q='/api/mbsim_reg?type='+type+'&addr='+encodeURIComponent(addr);\n  if(write) q+='&value='+encodeURIComponent(document.getElementById('mb-rv').value.trim());\n  apiGet(q).then(function(r){\n    if(!r.ok){ show('mb-msg', r.err||'失败'); return; }\n    show('mb-msg', write?'已写入':('地址 '+r.addr+' 当前值 '+r.value));\n  }).catch(function(){ show('mb-msg','无响应'); });\n}\ndocument.getElementById('mb-read').onclick=function(){ mbReg(false); };\ndocument.getElementById('mb-write').onclick=function(){ mbReg(true); };\n\nrenderStorage();\nrenderOta();\napiGet('/api/mbsim').then(renderSim).catch(function(){ show('mbs','读取失败'); });\nsetInterval(renderStorage, 8000);\nsetInterval(renderOta, 3000);\nsetInterval(function(){\n  var box=document.getElementById('mb-rules');\n  if(box && box.contains(document.activeElement)) return;\n  apiGet('/api/mbsim').then(renderSim).catch(function(){});\n}, 6000);\n</script>\r\n</body>\r\n</html>\r\n";
 
 static int bits_of(uart_word_length_t bits)
 {
@@ -198,14 +201,20 @@ static esp_err_t status_get(httpd_req_t *req)
     app_wifi_get(&wifi);
     app_time_format(now, sizeof(now));
 
-    char body[1400];
+    char body[1800];
     int n = snprintf(body, sizeof(body),
-                     "{\"time\":\"%s\",\"sd\":%s,\"free_mb\":%lu,\"ssid\":\"%s\",\"ip\":\"%s\",\"ports\":[",
+                     "{\"time\":\"%s\",\"sd\":%s,\"free_mb\":%lu,\"total_mb\":%lu,"
+                     "\"limit\":%u,\"cleaned\":%lu,\"ssid\":\"%s\",\"ip\":\"%s\",\"ports\":[",
                      now, view.sd_mounted ? "true" : "false",
-                     (unsigned long)view.sd_free_mb, wifi.ssid, wifi.ip);
-    for (int i = 0; i < APP_PORT_COUNT && n > 0 && n < (int)sizeof(body) - 80; i++) {
+                     (unsigned long)view.sd_free_mb,
+                     (unsigned long)view.sd_total_mb,
+                     cfg.disk_limit_pct,
+                     (unsigned long)view.cleaned_files,
+                     wifi.ssid, wifi.ip);
+    for (int i = 0; i < APP_PORT_COUNT && n > 0 && n < (int)sizeof(body) - 120; i++) {
         n += snprintf(body + n, sizeof(body) - (size_t)n,
-                      "%s{\"open\":%s,\"on\":%s,\"tx\":%llu,\"rx\":%llu,\"err\":%d,\"baud\":%lu,\"bits\":%d,\"stop\":\"%s\",\"parity\":\"%s\"}",
+                      "%s{\"open\":%s,\"on\":%s,\"tx\":%llu,\"rx\":%llu,\"err\":%d,"
+                      "\"baud\":%lu,\"bits\":%d,\"stop\":\"%s\",\"parity\":\"%s\",\"parse\":\"%s\"}",
                       i ? "," : "",
                       view.port[i].open ? "true" : "false",
                       cfg.port[i].enabled ? "true" : "false",
@@ -215,7 +224,8 @@ static esp_err_t status_get(httpd_req_t *req)
                       (unsigned long)cfg.port[i].baud,
                       bits_of(cfg.port[i].data_bits),
                       stop_of(cfg.port[i].stop_bits),
-                      parity_of(cfg.port[i].parity));
+                      parity_of(cfg.port[i].parity),
+                      app_parse_proto_name(cfg.port[i].parse_proto));
     }
     snprintf(body + n, sizeof(body) - (size_t)n, "]}");
     httpd_resp_set_type(req, "application/json");
@@ -346,6 +356,7 @@ static esp_err_t port_post(httpd_req_t *req)
     char stop_text[8] = {0};
     char parity_text[8] = {0};
     char on_text[8] = {0};
+    char parse_text[16] = {0};
     if (!req_value(req, "index", index_text, sizeof(index_text)) ||
         !req_value(req, "baud", baud_text, sizeof(baud_text)) ||
         !req_value(req, "bits", bits_text, sizeof(bits_text)) ||
@@ -361,8 +372,11 @@ static esp_err_t port_post(httpd_req_t *req)
     uart_word_length_t bits;
     uart_stop_bits_t stop;
     uart_parity_t parity;
+    uint8_t parse_proto = APP_PARSE_OFF;
+    bool has_parse = req_value(req, "parse", parse_text, sizeof(parse_text));
     if (index < 0 || index >= APP_PORT_COUNT || baud < 300 || baud > 2000000 ||
-        !parse_bits(bits_text, &bits) || !parse_stop(stop_text, &stop) || !parse_parity(parity_text, &parity)) {
+        !parse_bits(bits_text, &bits) || !parse_stop(stop_text, &stop) || !parse_parity(parity_text, &parity) ||
+        (has_parse && !app_parse_proto_from_name(parse_text, &parse_proto))) {
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"bad param\"}");
         return ESP_OK;
@@ -374,6 +388,9 @@ static esp_err_t port_post(httpd_req_t *req)
     cfg.port[index].stop_bits = stop;
     cfg.port[index].parity = parity;
     cfg.port[index].enabled = strcmp(on_text, "1") == 0;
+    if (has_parse) {
+        cfg.port[index].parse_proto = parse_proto;
+    }
     app_settings_save(&cfg);
     app_logger_request_reload();
     httpd_resp_set_type(req, "application/json");
@@ -912,6 +929,346 @@ static esp_err_t config_upload_post(httpd_req_t *req)
     return httpd_resp_sendstr(req, rc == 0 ? "{\"ok\":1}" : "{\"ok\":0,\"err\":\"配置无效或过大\"}");
 }
 
+static esp_err_t ota_status_get(httpd_req_t *req)
+{
+    app_ota_info_t info;
+    char msg[120];
+    app_ota_get_info(&info);
+    json_escape_text(info.msg, msg, sizeof(msg));
+    char body[480];
+    snprintf(body, sizeof(body),
+             "{\"ok\":1,\"available\":%s,\"pending\":%s,\"slot\":%d,\"next\":%d,"
+             "\"version\":\"%s\",\"phase\":%d,\"total\":%lu,\"written\":%lu,\"msg\":\"%s\"}",
+             info.available ? "true" : "false", info.pending_verify ? "true" : "false",
+             info.running_slot, info.next_slot, info.version, info.phase,
+             (unsigned long)info.total, (unsigned long)info.written, msg);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, body);
+}
+
+static esp_err_t ota_upload_post(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    int total = (int)req->content_len;
+    if (total <= 0) {
+        return httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"no content-length\"}");
+    }
+    int rc = app_ota_download_begin((size_t)total);
+    if (rc != 0) {
+        char body[96];
+        snprintf(body, sizeof(body), "{\"ok\":0,\"err\":\"begin failed %d\"}", rc);
+        return httpd_resp_sendstr(req, body);
+    }
+    uint8_t *buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = heap_caps_malloc(4096, MALLOC_CAP_8BIT);
+    }
+    if (!buf) {
+        app_ota_download_abort();
+        return httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"no mem\"}");
+    }
+
+    int got = 0;
+    bool failed = false;
+    while (got < total) {
+        int want = total - got > 4096 ? 4096 : total - got;
+        int r = httpd_req_recv(req, (char *)buf, want);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (r <= 0 || app_ota_download_write(buf, (size_t)r) != 0) {
+            failed = true;
+            break;
+        }
+        got += r;
+    }
+    free(buf);
+    if (failed) {
+        app_ota_download_abort();
+        return httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"transfer interrupted\"}");
+    }
+    rc = app_ota_download_end();
+    if (rc != 0) {
+        char body[96];
+        snprintf(body, sizeof(body), "{\"ok\":0,\"err\":\"verify failed %d\"}", rc);
+        return httpd_resp_sendstr(req, body);
+    }
+    return httpd_resp_sendstr(req, "{\"ok\":1,\"msg\":\"image staged, apply to install\"}");
+}
+
+static esp_err_t ota_action_get(httpd_req_t *req)
+{
+    char action[12] = {0};
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (!req_value(req, "do", action, sizeof(action))) {
+        return httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"missing do\"}");
+    }
+    if (!strcmp(action, "apply")) {
+        app_ota_request_apply();
+        return httpd_resp_sendstr(req, "{\"ok\":1,\"msg\":\"installing, device will reboot\"}");
+    }
+    if (!strcmp(action, "rollback")) {
+        app_ota_request_rollback();
+        return httpd_resp_sendstr(req, "{\"ok\":1,\"msg\":\"rollback requested\"}");
+    }
+    if (!strcmp(action, "confirm")) {
+        int rc = app_ota_confirm();
+        return httpd_resp_sendstr(req, rc == 0 ? "{\"ok\":1,\"msg\":\"confirmed\"}"
+                                               : "{\"ok\":0,\"err\":\"no pending image\"}");
+    }
+    return httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"unknown action\"}");
+}
+
+static uint32_t num_or(httpd_req_t *req, const char *key, uint32_t def)
+{
+    char text[16] = {0};
+    if (!req_value(req, key, text, sizeof(text))) {
+        return def;
+    }
+    return (uint32_t)strtoul(text, NULL, 0);
+}
+
+static bool flag_or(httpd_req_t *req, const char *key, bool def)
+{
+    char text[8] = {0};
+    if (!req_value(req, key, text, sizeof(text))) {
+        return def;
+    }
+    return atoi(text) != 0;
+}
+
+static int rule_values(httpd_req_t *req, uint16_t *vals, int max)
+{
+    char text[128] = {0};
+    if (!req_value(req, "values", text, sizeof(text))) {
+        return 0;
+    }
+    int n = 0;
+    char *p = text;
+    while (*p && n < max) {
+        vals[n++] = (uint16_t)strtoul(p, &p, 0);
+        if (*p == ',') {
+            p++;
+        }
+    }
+    return n;
+}
+
+static esp_err_t mbsim_get(httpd_req_t *req)
+{
+    mbs_cfg_t cfg;
+    mbs_stats_t st;
+    app_mbsim_get_cfg(&cfg);
+    app_mbsim_get_stats(&st);
+    char *body = heap_caps_malloc(3072, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!body) {
+        body = malloc(3072);
+    }
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no mem");
+        return ESP_FAIL;
+    }
+    int n = snprintf(body, 3072,
+                     "{\"ok\":1,\"slave\":{\"en\":%u,\"port\":%u,\"station\":%u,"
+                     "\"coil\":[%u,%u],\"disc\":[%u,%u],\"hold\":[%u,%u],\"input\":[%u,%u]},"
+                     "\"rules\":[",
+                     cfg.slave.enabled ? 1 : 0, cfg.slave.port, cfg.slave.station,
+                     cfg.slave.coil_start, cfg.slave.coil_count,
+                     cfg.slave.disc_start, cfg.slave.disc_count,
+                     cfg.slave.hold_start, cfg.slave.hold_count,
+                     cfg.slave.input_start, cfg.slave.input_count);
+    for (int i = 0; i < cfg.rule_count && n > 0 && n < 2600; i++) {
+        mbs_stats_t rs;
+        app_mbsim_get_rule_stats(i, &rs);
+        n += snprintf(body + n, 3072 - (size_t)n,
+                      "%s{\"en\":%u,\"port\":%u,\"slave\":%u,\"fc\":%u,\"start\":%u,"
+                      "\"qty\":%u,\"values\":[",
+                      i ? "," : "", cfg.rules[i].enabled, cfg.rules[i].port,
+                      cfg.rules[i].slave, cfg.rules[i].fc, cfg.rules[i].start,
+                      cfg.rules[i].qty);
+        for (int k = 0; k < cfg.rules[i].nvalues && n > 0 && n < 2900; k++) {
+            n += snprintf(body + n, 3072 - (size_t)n, "%s%u", k ? "," : "",
+                          cfg.rules[i].values[k]);
+        }
+        n += snprintf(body + n, 3072 - (size_t)n,
+                      "],\"period\":%lu,\"repeat\":%lu,\"req\":%lu,\"rsp\":%lu,"
+                      "\"to\":%lu,\"err\":%lu,\"status\":%d,\"last\":[",
+                      (unsigned long)cfg.rules[i].period_ms,
+                      (unsigned long)cfg.rules[i].repeat,
+                      (unsigned long)rs.requests, (unsigned long)rs.responses,
+                      (unsigned long)rs.timeouts, (unsigned long)rs.errors,
+                      rs.last_status);
+        for (int k = 0; k < rs.last_count && k < 8 && n > 0 && n < 2960; k++) {
+            n += snprintf(body + n, 3072 - (size_t)n, "%s%u", k ? "," : "",
+                          rs.last_values[k]);
+        }
+        snprintf(body + n, 3072 - (size_t)n, "]}");
+        n = (int)strlen(body);
+    }
+    snprintf(body + n, 3072 - (size_t)n,
+             "],\"stats\":{\"req\":%lu,\"rsp\":%lu,\"to\":%lu,\"err\":%lu,\"sreq\":%lu,\"srsp\":%lu}}",
+             (unsigned long)st.requests, (unsigned long)st.responses,
+             (unsigned long)st.timeouts, (unsigned long)st.errors,
+             (unsigned long)st.slave_requests, (unsigned long)st.slave_responses);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t err = httpd_resp_sendstr(req, body);
+    free(body);
+    return err;
+}
+
+static esp_err_t mbsim_cfg_get(httpd_req_t *req)
+{
+    char action[12] = {0};
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (!req_value(req, "action", action, sizeof(action))) {
+        return httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"missing action\"}");
+    }
+
+    mbs_cfg_t cfg;
+    app_mbsim_get_cfg(&cfg);
+    int rc;
+
+    if (!strcmp(action, "slave")) {
+        cfg.slave.enabled = flag_or(req, "en", cfg.slave.enabled) ? 1 : 0;
+        cfg.slave.port = (uint8_t)num_or(req, "port", cfg.slave.port);
+        cfg.slave.station = (uint8_t)num_or(req, "station", cfg.slave.station);
+        cfg.slave.coil_start = (uint16_t)num_or(req, "cs", cfg.slave.coil_start);
+        cfg.slave.coil_count = (uint16_t)num_or(req, "cc", cfg.slave.coil_count);
+        cfg.slave.disc_start = (uint16_t)num_or(req, "ds", cfg.slave.disc_start);
+        cfg.slave.disc_count = (uint16_t)num_or(req, "dc", cfg.slave.disc_count);
+        cfg.slave.hold_start = (uint16_t)num_or(req, "hs", cfg.slave.hold_start);
+        cfg.slave.hold_count = (uint16_t)num_or(req, "hc", cfg.slave.hold_count);
+        cfg.slave.input_start = (uint16_t)num_or(req, "is", cfg.slave.input_start);
+        cfg.slave.input_count = (uint16_t)num_or(req, "ic", cfg.slave.input_count);
+        rc = app_mbsim_set_cfg(&cfg);
+    } else if (!strcmp(action, "rule")) {
+        int idx = (int)num_or(req, "idx", 0);
+        if (idx < 0 || idx > cfg.rule_count || idx >= MBS_RULE_MAX) {
+            return httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"bad index\"}");
+        }
+        mbs_rule_cfg_t rule;
+        memset(&rule, 0, sizeof(rule));
+        if (idx < cfg.rule_count) {
+            rule = cfg.rules[idx];
+        } else {
+            rule.enabled = 1;
+            rule.port = 1;
+            rule.slave = 1;
+            rule.fc = 3;
+            rule.qty = 1;
+            rule.period_ms = 1000;
+        }
+        rule.enabled = flag_or(req, "en", rule.enabled != 0) ? 1 : 0;
+        rule.port = (uint8_t)num_or(req, "port", rule.port);
+        rule.slave = (uint8_t)num_or(req, "slave", rule.slave);
+        rule.fc = (uint8_t)num_or(req, "fc", rule.fc);
+        rule.start = (uint16_t)num_or(req, "start", rule.start);
+        rule.qty = (uint16_t)num_or(req, "qty", rule.qty);
+        rule.period_ms = num_or(req, "period", rule.period_ms);
+        rule.repeat = num_or(req, "repeat", rule.repeat);
+        int nv = rule_values(req, rule.values, MBS_VALUE_MAX);
+        if (nv > 0) {
+            rule.nvalues = (uint8_t)nv;
+        }
+        rc = app_mbsim_set_rule(idx, &rule);
+    } else if (!strcmp(action, "del")) {
+        rc = app_mbsim_del_rule((int)num_or(req, "idx", 0));
+    } else if (!strcmp(action, "run")) {
+        app_mbsim_trigger((int)num_or(req, "idx", 0));
+        rc = 0;
+    } else {
+        return httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"unknown action\"}");
+    }
+
+    if (rc != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "{\"ok\":0,\"err\":\"rejected %d\"}", rc);
+        return httpd_resp_sendstr(req, msg);
+    }
+    return mbsim_get(req);
+}
+
+static esp_err_t mbsim_reg_get(httpd_req_t *req)
+{
+    char type[8] = {0};
+    char addr_text[8] = {0};
+    char value_text[8] = {0};
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (!req_value(req, "type", type, sizeof(type)) ||
+        !req_value(req, "addr", addr_text, sizeof(addr_text))) {
+        return httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"missing type/addr\"}");
+    }
+    uint16_t addr = (uint16_t)strtoul(addr_text, NULL, 0);
+    char body[96];
+    if (req_value(req, "value", value_text, sizeof(value_text))) {
+        bool ok = app_mbsim_value_set(type, addr, (uint16_t)strtoul(value_text, NULL, 0));
+        snprintf(body, sizeof(body), ok ? "{\"ok\":1}" : "{\"ok\":0,\"err\":\"out of range\"}");
+        return httpd_resp_sendstr(req, body);
+    }
+    uint16_t value = 0;
+    if (!app_mbsim_value_get(type, addr, &value)) {
+        return httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"out of range\"}");
+    }
+    snprintf(body, sizeof(body), "{\"ok\":1,\"type\":\"%s\",\"addr\":%u,\"value\":%u}",
+             type, addr, value);
+    return httpd_resp_sendstr(req, body);
+}
+
+// GET /api/storage?limit=85
+// Read the storage watermark; when "limit" is present it is persisted first.
+static esp_err_t storage_get(httpd_req_t *req)
+{
+    app_settings_t cfg;
+    app_settings_get(&cfg);
+    char limit_text[8] = {0};
+    if (req_value(req, "limit", limit_text, sizeof(limit_text))) {
+        int limit = atoi(limit_text);
+        if (limit < 1 || limit > 99) {
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"limit 1-99\"}");
+        }
+        cfg.disk_limit_pct = (uint8_t)limit;
+        app_settings_save(&cfg);
+    }
+    app_view_t view;
+    app_logger_get_view(&view);
+    char body[160];
+    snprintf(body, sizeof(body),
+             "{\"ok\":1,\"limit\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"cleaned\":%lu}",
+             cfg.disk_limit_pct, (unsigned long)view.sd_total_mb,
+             (unsigned long)view.sd_free_mb, (unsigned long)view.cleaned_files);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, body);
+}
+
+// GET /api/logs_clear?port=0|1|2
+// Deletes the oldest files of one channel only; without "port" every channel
+// is trimmed independently (never a cross-channel delete).
+static esp_err_t logs_clear_get(httpd_req_t *req)
+{
+    char port_text[8] = {0};
+    int port = -1;
+    if (req_value(req, "port", port_text, sizeof(port_text))) {
+        port = atoi(port_text);
+        if (port < 0 || port >= APP_PORT_COUNT) {
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":0,\"err\":\"bad port\"}");
+        }
+    }
+    app_logger_request_clear_logs(port);
+    char body[48];
+    snprintf(body, sizeof(body), "{\"ok\":1,\"port\":%d}", port);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
+}
+
 void app_httpd_start(void)
 {
     if (s_server) {
@@ -921,7 +1278,7 @@ void app_httpd_start(void)
     config.max_open_sockets = 4;
     config.lru_purge_enable = true;
     config.stack_size = 8192;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 24;
     config.recv_wait_timeout = 10;
     config.send_wait_timeout = 20;
     esp_err_t rc = httpd_start(&s_server, &config);
@@ -943,6 +1300,14 @@ void app_httpd_start(void)
     const httpd_uri_t bridge_ble = {.uri = "/api/bridge_ble", .method = HTTP_GET, .handler = bridge_ble_post};
     const httpd_uri_t cfg = {.uri = "/api/config", .method = HTTP_GET, .handler = config_get};
     const httpd_uri_t cfg_up = {.uri = "/api/config_upload", .method = HTTP_POST, .handler = config_upload_post};
+    const httpd_uri_t ota = {.uri = "/api/ota", .method = HTTP_GET, .handler = ota_status_get};
+    const httpd_uri_t ota_up = {.uri = "/api/ota_upload", .method = HTTP_POST, .handler = ota_upload_post};
+    const httpd_uri_t ota_act = {.uri = "/api/ota_action", .method = HTTP_GET, .handler = ota_action_get};
+    const httpd_uri_t mbsim = {.uri = "/api/mbsim", .method = HTTP_GET, .handler = mbsim_get};
+    const httpd_uri_t mbsim_cfg = {.uri = "/api/mbsim_cfg", .method = HTTP_GET, .handler = mbsim_cfg_get};
+    const httpd_uri_t mbsim_reg = {.uri = "/api/mbsim_reg", .method = HTTP_GET, .handler = mbsim_reg_get};
+    const httpd_uri_t storage = {.uri = "/api/storage", .method = HTTP_GET, .handler = storage_get};
+    const httpd_uri_t logs_clear = {.uri = "/api/logs_clear", .method = HTTP_GET, .handler = logs_clear_get};
     httpd_register_uri_handler(s_server, &root);
     httpd_register_uri_handler(s_server, &status);
     httpd_register_uri_handler(s_server, &files);
@@ -956,6 +1321,14 @@ void app_httpd_start(void)
     httpd_register_uri_handler(s_server, &bridge_ble);
     httpd_register_uri_handler(s_server, &cfg);
     httpd_register_uri_handler(s_server, &cfg_up);
+    httpd_register_uri_handler(s_server, &ota);
+    httpd_register_uri_handler(s_server, &ota_up);
+    httpd_register_uri_handler(s_server, &ota_act);
+    httpd_register_uri_handler(s_server, &mbsim);
+    httpd_register_uri_handler(s_server, &mbsim_cfg);
+    httpd_register_uri_handler(s_server, &mbsim_reg);
+    httpd_register_uri_handler(s_server, &storage);
+    httpd_register_uri_handler(s_server, &logs_clear);
     httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, captive_404);
     esp_log_level_set("httpd_uri", ESP_LOG_ERROR);
     esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
