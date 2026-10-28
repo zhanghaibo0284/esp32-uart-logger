@@ -7,6 +7,10 @@
 // Checksums
 // ---------------------------------------------------------------------------
 
+/* Modbus RTU CRC16（多项式 0xA001 反射算法，初值 0xFFFF）。
+ * 参数：data/len 参与计算的字节（不含 CRC 本身）。
+ * 返回 CRC 值；帧内发送时低字节在前、高字节在后。
+ */
 static uint16_t mb_crc16(const uint8_t *data, int len)
 {
     uint16_t crc = 0xFFFF;
@@ -23,6 +27,9 @@ static uint16_t mb_crc16(const uint8_t *data, int len)
     return crc;
 }
 
+/* Modbus ASCII 的 LRC 校验：所有字节求和后取二进制补码。
+ * 返回单字节校验值，帧中以两个十六进制字符（大写）表示。
+ */
 static uint8_t mb_lrc(const uint8_t *data, int len)
 {
     uint8_t sum = 0;
@@ -32,6 +39,7 @@ static uint8_t mb_lrc(const uint8_t *data, int len)
     return (uint8_t)(-(int8_t)sum);
 }
 
+/* 单个十六进制字符转数值：0-9/A-F/a-f 有效，其它返回 -1（用于 ASCII 帧解码校验）。 */
 static int hex_val(char ch)
 {
     if (ch >= '0' && ch <= '9') return ch - '0';
@@ -64,12 +72,19 @@ typedef struct {
     uint8_t status;
 } pdu_t;
 
+/* 大端读取 16 位（Modbus 协议所有寄存器/地址字段均为高字节在前）。 */
 static uint16_t rd16(const uint8_t *p)
 {
     return (uint16_t)((p[0] << 8) | p[1]);
 }
 
-// pdu points at the raw frame: [addr][fc][...data...], with no checksum.
+/* 解析一帧的 PDU 结构（输入为去掉校验后的 [addr][fc][data...]）。
+ * 参数：pdu/len 原始帧；out 输出结构（内部先清零）。
+ * 实现思路：不同功能码的“合法长度”是固定或可推导的，因此按长度判定
+ *   是请求还是响应，无法区分时标记 CAND_AMB（由历史配对状态决定）。
+ * 返回：无；无法识别时 out->cand = CAND_UNKNOWN。
+ * 覆盖功能码：01-08、0B、0C、0F、10、14、15、16、17 及异常响应。
+ */
 static void parse_pdu(const uint8_t *pdu, int len, pdu_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -203,6 +218,9 @@ typedef struct {
 
 static pending_t s_pending[APP_PORT_COUNT];
 
+/* 清空某通道的“请求-响应对”状态（串口重载/异常重启时调用）。
+ * 参数 port 越界时忽略。
+ */
 void app_modbus_reset(int port)
 {
     if (port >= 0 && port < APP_PORT_COUNT) {
@@ -210,6 +228,16 @@ void app_modbus_reset(int port)
     }
 }
 
+/* 判定一帧的角色（请求 REQ / 响应 RSP），并维护每通道的配对状态。
+ * 参数：port 通道；pdu 已解析的帧；own_tx true 表示本机发出（必然为请求）。
+ * 返回：角色枚举。
+ * 判定规则：
+ *   - 本机发送：非异常帧一律视为 REQ，并记住 addr/fc 供后续响应配对；
+ *   - 结构明确为响应（长度/字节数自洽）→ RSP，清除 pending；
+ *   - 结构明确为请求 → REQ，记录 pending；
+ *   - 二义性帧（如 05/06/0F/10 的回显）：若与 pending 的 addr/fc 相同，
+ *     视为响应，否则视为新的请求。
+ */
 static mb_role_t resolve_role(int port, const pdu_t *pdu, bool own_tx)
 {
     pending_t *pend = &s_pending[port];
@@ -250,6 +278,7 @@ static mb_role_t resolve_role(int port, const pdu_t *pdu, bool own_tx)
 // Annotation
 // ---------------------------------------------------------------------------
 
+/* 功能码 → 可读名称（写入日志注释，便于人工阅读）。未收录的返回 "UNKNOWN"。 */
 static const char *fc_name(uint8_t fc)
 {
     switch (fc) {
@@ -273,6 +302,15 @@ static const char *fc_name(uint8_t fc)
     }
 }
 
+/* 生成日志行末尾的 Modbus 注释，例如：
+ *   "# MB-RTU RSP addr=1 fc=3 READ_HOLD bytes=8 check=OK"
+ * 参数：
+ *   pdu       已解析帧；role 角色；is_ascii 是否 ASCII 帧；check_ok 校验是否通过；
+ *   note/note_len 输出缓冲（建议 >=96 字节，超长自动截断）。
+ * 实现：先写公共前缀（协议/角色/地址/功能码/名称），再按功能码追加
+ *       地址、数量、值、异常码等关键字段，最后附加校验结论。
+ * 边界：snprintf 的返回值不用于累加，统一用 strlen 求已用长度，避免截断错位。
+ */
 static void make_note(const pdu_t *pdu, mb_role_t role, bool is_ascii, bool check_ok,
                       char *note, size_t note_len)
 {
@@ -344,8 +382,13 @@ static void make_note(const pdu_t *pdu, mb_role_t role, bool is_ascii, bool chec
 // Raw burst scanning: CRC-valid frame boundaries via sequential grammar
 // ---------------------------------------------------------------------------
 
-// Candidate total frame lengths (incl checksum) starting with the given bytes.
-// Returns count; out[] receives candidates ordered by preference.
+/* 列出从当前位置起始时，符合语法的候选帧总长度（含 2 字节 CRC）。
+ * 参数：p 帧起点；remaining 剩余字节；out[2] 输出候选长度（按优先级排序）。
+ * 返回候选数量（0..2）。
+ * 说明：同一功能码往往存在“请求固定长、响应可变长”两种可能，
+ *       因此这里给出候选，真正的接受与否由调用方用 CRC 校验裁决。
+ *       例如 0x03：先试 8 字节请求，再试 5+bytecount 的响应。
+ */
 static int candidates_at(const uint8_t *p, int remaining, int out[2])
 {
     if (remaining < 4) {
@@ -412,6 +455,18 @@ static int candidates_at(const uint8_t *p, int remaining, int out[2])
     return n;
 }
 
+/* 扫描一段原始字节，按“语法候选 + CRC 校验”顺序找出所有完整帧边界。
+ * 参数：
+ *   data/len 输入字节；lens 输出每个帧的结束偏移（绝对，相对 data）；
+ *   maxn    lens 容量上限。
+ * 返回识别出的帧数。
+ * 关键步骤：
+ *   1. 从 pos 开始取候选长度；
+ *   2. 依次试每个候选的 CRC（低字节在前），第一个通过即为该帧长度；
+ *   3. 全部候选都不过则停止扫描（遇到非 Modbus 数据或半个帧），
+ *      由调用方决定继续等待或按原始 HEX 记录。
+ * 异常处理：不会越界读——候选长度均先检查 remaining。
+ */
 int app_modbus_scan(const uint8_t *data, int len, int *lens, int maxn)
 {
     int count = 0;
@@ -437,6 +492,13 @@ int app_modbus_scan(const uint8_t *data, int len, int *lens, int maxn)
     return count;
 }
 
+/* 判断当前缓冲是否可能是“某个 Modbus 帧的前缀”（即还需要更多字节）。
+ * 参数：data/len 当前缓冲（至少 2 字节才有意义）。
+ * 返回 true=头部字段声明了更长的帧，应继续等待；false=不可能是前缀。
+ * 用途：帧间隙到来时，若仍是前缀则继续组装（避免把长响应拆成两帧）；
+ *       否则按原始数据输出。头部信息不足时（如 0x10 只有 6 字节）也返回
+ *       true 等待，避免过早判死。
+ */
 bool app_modbus_prefix(const uint8_t *data, int len)
 {
     if (len < 2) {
@@ -479,6 +541,22 @@ bool app_modbus_prefix(const uint8_t *data, int len)
     }
     return total > len;
 }
+
+/* 分析一帧并产出结构化信息与日志注释（logger 每帧调用一次）。
+ * 参数：
+ *   port    通道索引（用于查请求/响应配对状态）；
+ *   frame/len 完整帧（RTU 含 2 字节 CRC；ASCII 以 ':' 开头、CRLF 结尾）；
+ *   own_tx  是否本机发送；
+ *   info    输出：parsed/check_ok/is_ascii/addr/fc/role；
+ *   note/note_len 输出注释文本（可为 NULL，表示不需要注释）。
+ * 返回：无。帧过短、校验结构非法或功能码无法识别时，info->parsed 保持 false
+ *       且 comment 为空，调用方据此只记录原始 HEX（不做协议臆测）。
+ * 关键步骤：
+ *   1. ASCII 帧先做十六进制解码并校验 LRC；RTU 直接校验 CRC（低字节在前）；
+ *   2. parse_pdu 解析字段并判定候选类型；
+ *   3. resolve_role 结合历史配对确定 REQ/RSP；
+ *   4. make_note 生成人类可读注释。
+ */
 void app_modbus_frame(int port, const uint8_t *frame, int len, bool own_tx,
                       mb_info_t *info, char *note, size_t note_len)
 {

@@ -35,6 +35,10 @@ static void cfg_free(void *ptr)
     heap_caps_free(ptr);
 }
 
+/* 把 cJSON 的分配器切到 PSRAM（只执行一次，幂等）。
+ * 背景：配置文件含大量小节点/字符串，若走默认 malloc 会吃掉内部堆，
+ *       导致 WiFi/BLE/httpd 启动时出现 NO_MEM。必须在任何 cJSON 调用前执行。
+ */
 void app_config_init(void)
 {
     static bool inited;
@@ -49,6 +53,9 @@ void app_config_init(void)
     inited = true;
 }
 
+/* 记录最近一次配置操作的结果，并刷新“配置文件/备份是否存在”状态。
+ * 参数：ok 是否成功；msg 中文提示（会截断到状态结构体长度）。
+ */
 static void set_status(bool ok, const char *msg)
 {
     s_status.last_ok = ok;
@@ -62,6 +69,14 @@ static void set_status(bool ok, const char *msg)
 // Serialize
 // ---------------------------------------------------------------------------
 
+/* 生成 config.json 的“标准快照”（紧凑 JSON，字段顺序固定）。
+ * 参数 out/out_len：输出缓冲（建议 2048 字节，超长会截断）。
+ * 用途：① 导出写盘；② 变更检测（与卡上文件逐字节比较）。
+ * 字段：magic/version/segment_min/screen_auto_off、ports[3]、
+ *       wifi{ssid,pass}、bridge{tcp_on[],tcp_port[],ble_on,ble_port,ble_name}。
+ * 注意：数值均以数字/布尔/字符串的规范形式输出，保证同一配置生成
+ *       完全一致的文本，避免无意义的重复导出。
+ */
 void app_config_build_snapshot(char *out, size_t out_len)
 {
     if (!out || out_len == 0) {
@@ -131,6 +146,10 @@ void app_config_build_snapshot(char *out, size_t out_len)
 // Validation helpers
 // ---------------------------------------------------------------------------
 
+/* 校验字符串是否全部为可见 ASCII 且长度在 [min_len, max_len] 内。
+ * 返回 true=合法。用于 SSID/密码/BLE 名称，过滤换行、控制字符与中文，
+ * 避免写进 WiFi/BLE 协议栈后出现不可预期的截断或乱码。
+ */
 static bool visible_ascii(const char *text, int min_len, int max_len)
 {
     if (!text) {
@@ -158,6 +177,19 @@ static bool str_eq(const cJSON *item, const char *value)
 // Import
 // ---------------------------------------------------------------------------
 
+/* 把 JSON 文本导入为运行配置并持久化到 NVS。
+ * 参数：text/len 完整的配置文本（长度上限 APP_CONFIG_FILE_BYTES）。
+ * 返回 0=成功；-1=失败（SD 未挂载、文本为空/过大、JSON 语法错误、
+ *        magic/版本不符、任一字段越界、WiFi/透传持久化失败）。
+ * 关键步骤：
+ *   1. 解析 JSON（失败即返回，不改动现有配置）；
+ *   2. 逐字段校验：分段 1..1440 分钟；每路 baud 300..2000000、
+ *      数据位 5..8、停止位 1/1.5/2、校验 N/E/O、enabled 布尔；
+ *      SSID 1..32、密码 8..63 可见 ASCII；TCP 端口 >=1024、BLE 绑定通道合法；
+ *   3. 全部通过后才依次写 settings/wifi/bridge，保证不会半套生效；
+ *   4. 结果（含中文错误原因）写入状态结构供 Web 显示。
+ * 注意：导入只更新 NVS，串口参数需调用方再触发 logger reload 才会生效。
+ */
 int app_config_import_text(const char *text, size_t len)
 {
     if (!app_sd_is_mounted()) {
@@ -317,6 +349,10 @@ invalid:
 // File operations
 // ---------------------------------------------------------------------------
 
+/* 读整个文件到 buf（最多 buf_len-1 字节，末尾补 '\0'）。
+ * 返回实际读到的字节数；-1 表示打开失败或读出错。
+ * 全程持 app_fs_lock，与日志写入/Web 下载互斥。
+ */
 static int read_file(const char *path, char *buf, size_t buf_len)
 {
     int rc = -1;
@@ -334,6 +370,12 @@ static int read_file(const char *path, char *buf, size_t buf_len)
     return rc;
 }
 
+/* 检测卡上 config.json 是否需要重新导出。
+ * 参数 needs：输出“是否需要导出”。
+ * 返回 0=检测完成（needs 有效）；-1=内存不足。
+ * 判据：文件不存在，或与标准快照文本不完全一致 → needs=true。
+ * 说明：该函数会读文件（阻塞数毫秒），仅可由 logger 在“帧间隙”调用。
+ */
 int app_config_needs_export(bool *needs)
 {
     if (!needs) {
@@ -359,6 +401,10 @@ int app_config_needs_export(bool *needs)
     return 0;
 }
 
+/* 每次覆盖 config.json 前调用：把现有文件流式复制为 config.json.bak。
+ * 采用 1KB 分块拷贝而非整读整写，避免占用大块内存。
+ * 文件不存在或任一打开失败时静默返回（不阻断导出流程）。
+ */
 static void backup_existing(void)
 {
     struct stat st;
@@ -383,6 +429,16 @@ static void backup_existing(void)
     app_fs_unlock();
 }
 
+/* 把当前运行配置导出到 TF 卡根目录的 config.json。
+ * 返回 0=成功；-1=失败（SD 未挂载/内存不足/写临时文件失败/替换失败）。
+ * 关键步骤（原子替换）：
+ *   1. 生成标准快照；
+ *   2. 写入隐藏临时文件 .cfg.tmp 并 fflush，避免写一半断电损坏正式文件；
+ *   3. 备份旧文件为 config.json.bak；
+ *   4. FatFs 的 rename 不允许目标已存在，因此先 remove 旧文件再 rename。
+ * 异常处理：任一步失败都保留原 config.json（或已备份的 .bak），
+ *           并通过 set_status 把原因反馈到 Web/屏幕。
+ */
 int app_config_export(void)
 {
     if (!app_sd_is_mounted()) {
@@ -433,6 +489,9 @@ int app_config_export(void)
     return result;
 }
 
+/* 从卡上 config.json 重新加载配置（Web「从卡重载」/启动时可选调用）。
+ * 返回 0=成功；1=文件不存在（保持当前配置）；-1=其它失败（含解析/字段非法）。
+ */
 int app_config_load(void)
 {
     if (!app_sd_is_mounted()) {
@@ -456,6 +515,9 @@ int app_config_load(void)
     return rc;
 }
 
+/* 从 config.json.bak 恢复配置并写入 NVS（Web「恢复备份」）。
+ * 返回 0=成功；-1=备份不存在或导入失败。
+ */
 int app_config_restore_backup(void)
 {
     if (!app_sd_is_mounted()) {
@@ -479,6 +541,10 @@ int app_config_restore_backup(void)
     return rc;
 }
 
+/* 输出配置状态快照：最近一次操作成功与否、提示语、文件与备份是否存在。
+ * 参数 out 为空时直接返回；读取时会重新 stat 两个文件，保证显示实时。
+ * 内部直接修改静态 s_status 再整体拷贝，避免与并发 stat 的结果交叉。
+ */
 void app_config_get_status(app_config_status_t *out)
 {
     if (!out) {

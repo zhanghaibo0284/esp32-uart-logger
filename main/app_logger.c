@@ -92,6 +92,13 @@ static char s_sd_msg[48] = "等待SD卡";
 // --- config change detection ------------------------------------------------
 static int64_t last_cfg_check_us = -2000000;
 
+/* 把一段已格式化的文本追加到指定通道的实时环形缓冲（供 Web /api/live 轮询）。
+ * 参数：
+ *   index  通道索引 0..APP_PORT_COUNT-1，越界直接丢弃；
+ *   text   NUL 结尾的字符串，'\r' 会被过滤以统一网页显示。
+ * 说明：写指针 s_live_end 单调递增，读取端用 "游标 % LIVE_CAP" 定位，
+ *       因此无需搬移数据；缓冲满后旧内容被自然覆盖。全程持 s_lock 保护。
+ */
 static void live_append(int index, const char *text)
 {
     if (index < 0 || index >= APP_PORT_COUNT || !text) {
@@ -114,6 +121,10 @@ static void copy_msg(char *dst, size_t n, const char *src)
     snprintf(dst, n, "%s", src ? src : "");
 }
 
+/* 把 SD 卡容量/挂载状态/提示语汇总进共享视图 s_view，供 UI 与 Web 读取。
+ * 关键步骤：先查挂载状态与容量（可能访问 FAT 层），再持锁一次性更新，
+ * 避免读到的字段来自不同时刻。无返回值，失败时容量为 0。
+ */
 static void publish_sd(void)
 {
     uint32_t total = 0;
@@ -127,6 +138,9 @@ static void publish_sd(void)
     xSemaphoreGive(s_lock);
 }
 
+/* 把某通道的串口参数格式化后写入共享视图（Web/UI 显示“115200 8N1”）。
+ * 参数 index：通道索引，调用方保证合法。
+ */
 static void publish_port(int index)
 {
     char param[24];
@@ -137,6 +151,11 @@ static void publish_port(int index)
     xSemaphoreGive(s_lock);
 }
 
+/* 关闭某通道的日志文件：先 flush+fsync 保证已写内容落盘，再 fclose。
+ * 全程持 app_fs_lock，避免与 Web 下载/删除/屏幕浏览并发访问 FAT。
+ * 异常处理：fsync/fclose 失败时仅记录内核层错误，指针仍被清空，
+ * 下次写帧会重新 fopen 追加，不会因单次失败卡死通道。
+ */
 static void close_file(int index)
 {
     app_fs_lock();
@@ -150,6 +169,10 @@ static void close_file(int index)
     app_fs_unlock();
 }
 
+/* 关闭并卸载某通道的 UART 驱动与事件队列。
+ * 用于参数变更/关闭通道：先 delete 驱动释放 RX 环形缓冲，再删除事件队列，
+ * 置 s_uart_on=false，让 logger_task 跳过该通道。可重复调用（幂等）。
+ */
 static void close_uart(int index)
 {
     if (s_uart_on[index]) {
@@ -162,7 +185,10 @@ static void close_uart(int index)
     }
 }
 
-// Total bit-times per serial character with the given framing.
+/* 计算一个字符占用的总位时间（起始位+数据位+校验位+停止位）。
+ * 参数 ps：端口参数；返回位数（如 8N1 = 10 位）。
+ * 用途：换算 RX 超时（3.5 字符）与每个字节的到达时间偏移。
+ */
 static int frame_bits(const port_setting_t *ps)
 {
     int bits = 1;                                     // start bit
@@ -174,6 +200,13 @@ static int frame_bits(const port_setting_t *ps)
 
 static int byte_time_us(int index);   // full definition after frame builder
 
+/* 按当前参数打开某通道 UART（参数配置→引脚→驱动→超时）。
+ * 返回 ESP_OK 成功；否则返回 esp_err_t 错误码（参数/引脚/内存不足）。
+ * 异常处理：驱动安装内存不足时按 2048→1024→256 字节逐级降级 RX 缓冲；
+ * 全部失败则删除事件队列并保持通道关闭，由上层写入 error 供界面显示。
+ * 关键点：RX 超时设为 3.5 字符位时间，正好等于 Modbus RTU 帧间隔，
+ * 使一个 UART_DATA(timeout) 事件对应一帧，避免任务调度抖动导致粘帧。
+ */
 static int open_uart(int index)
 {
     uart_config_t cfg = {
@@ -241,6 +274,13 @@ static int open_uart(int index)
     return ESP_OK;
 }
 
+/* 读取 NVS 配置并使其在运行时生效（分段时长 + 每路串口参数/开关）。
+ * 关键步骤：
+ *   1. 逐路比较新旧参数，未变化则只刷新界面参数，不打断接收；
+ *   2. 变化时依次关闭 UART/文件、清空帧组装器与 Modbus 解析状态；
+ *   3. 需要开启的通道重新 open_uart，失败记录 error 并保留“已关闭”状态。
+ * 该函数只在 logger_task 上下文调用，避免跨任务操作硬件。
+ */
 static void apply_settings(void)
 {
     app_settings_t cfg;
@@ -285,6 +325,16 @@ static void apply_settings(void)
     }
 }
 
+/* 确保某通道在 now 时刻有对应的日志文件，必要时切换新分段文件。
+ * 参数：index 通道；now 当前时间（秒），用于计算所属分段起点。
+ * 返回 true=已打开可用文件；false=未挂载或打开失败（error=-2，界面可见）。
+ * 关键步骤：
+ *   1. 计算分段起点：把一天的秒数按 segment_min 对齐，得到固定分段时间窗；
+ *   2. 当前文件已属于该窗口则直接复用，否则关闭旧文件、按新窗口名新建；
+ *   3. 新文件为空时写入 3 行注释头（引脚/参数/格式说明），便于事后分析。
+ * 命名：/sdcard/UART<i>/YYYYmmdd_HHMMSS.txt，同一通道同窗口自动追加。
+ * 全程持 app_fs_lock，与 Web 的下载/删除互斥。
+ */
 static bool ensure_file(int index, time_t now)
 {
     app_fs_lock();
@@ -308,12 +358,25 @@ static bool ensure_file(int index, time_t now)
     }
     close_file(index);
 
+    /* 按帧所属自然日按需创建目录 /sdcard/YYYY-MM-DD 与 /sdcard/YYYY-MM-DD/UARTx。
+     * 幂等（mkdir 返回 EEXIST 即已存在）。若创建失败则降级：本帧不落盘，error=-3。
+     */
+    if (!app_sd_ensure_log_dir(index, start)) {
+        ESP_LOGE(TAG, "ensure log dir failed for UART%d", index);
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_view.port[index].file_name[0] = '\0';
+        s_view.port[index].error = -3;
+        xSemaphoreGive(s_lock);
+        app_fs_unlock();
+        return false;
+    }
+
     struct tm tm;
     localtime_r(&start, &tm);
     char name[24];
     strftime(name, sizeof(name), "%Y%m%d_%H%M%S.txt", &tm);
-    char path[64];
-    snprintf(path, sizeof(path), APP_SD_MOUNT "/UART%d/%s", index, name);
+    char path[96];
+    app_sd_log_path(index, start, path, sizeof(path));
     FILE *fp = fopen(path, "a");
     if (!fp) {
         ESP_LOGE(TAG, "open %s failed", path);
@@ -337,13 +400,21 @@ static bool ensure_file(int index, time_t now)
     }
     s_fp[index] = fp;
     s_file_start[index] = start;
+    /* 保存相对路径（相对 /sdcard），供活动文件判断与控制台显示：YYYY-MM-DD/UARTx/YYYYmmdd_HHMMSS.txt */
+    char date[16];
+    strftime(date, sizeof(date), "%Y-%m-%d", &tm);
+    char rel[64];
+    snprintf(rel, sizeof(rel), "%s/UART%d/%s", date, index, name);
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    copy_msg(s_view.port[index].file_name, sizeof(s_view.port[index].file_name), name);
+    copy_msg(s_view.port[index].file_name, sizeof(s_view.port[index].file_name), rel);
     xSemaphoreGive(s_lock);
     app_fs_unlock();
     return true;
 }
 
+/* 记录最近一帧到共享视图：last_hex 保存 "U<i> XX XX ..."（截断到 72 字节），
+ * last_port 标记来源通道，frame_seq 自增作为“有新帧”的事件令牌供 UI 判断。
+ */
 static void remember_frame(int index, const uint8_t *data, int len)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -357,7 +428,20 @@ static void remember_frame(int index, const uint8_t *data, int len)
     xSemaphoreGive(s_lock);
 }
 
-// One complete frame: marker + HEX line (+ Modbus annotation).
+/* 生成并投递一条完整日志行：时间戳 + TX/RX(-REQ/-RSP) + 大写 HEX，
+ * 可选追加 Modbus 解析注释；同时写入实时缓冲，最后交给磁盘写任务。
+ * 参数：
+ *   index  通道索引；
+ *   tv     帧首字节的到达时间（毫秒精度写入时间戳）；
+ *   data   原始字节；len 字节数（<=0 直接返回）；
+ *   own_tx true=本机发送的帧（由 TX 队列/测试/周期发送产生）。
+ * 关键步骤：
+ *   1. app_modbus_frame 解析帧角色并生成注释 note；
+ *   2. 在固定的 PSRAM 行缓冲中拼装文本（避免每帧 2KB 栈开销）；
+ *   3. live_append 先更新网页实时流，再把行拷贝进 disk_msg 投递队列；
+ *      队列满（磁盘长时间卡顿）时丢弃该行并累加 drop_lines。
+ * 异常处理：字幕转换/格式化失败仅导致行缩短；队列发送失败不阻塞 RX。
+ */
 static void write_frame(int index, const struct timeval *tv,
                         const uint8_t *data, int len, bool own_tx)
 {
@@ -440,6 +524,7 @@ static void write_frame(int index, const struct timeval *tv,
     }
 }
 
+/* 输出并清空当前通道的帧组装缓冲；无有效数据时只重置状态。 */
 static void flush_frame(int index)
 {
     frame_builder_t *builder = &s_builder[index];
@@ -453,8 +538,10 @@ static void flush_frame(int index)
     builder->count = 0;
 }
 
-// Write the first L assembled bytes as one frame, then compact the builder and
-// shift the timestamp for the remainder (used to split glued grammar frames).
+/* 把组装器中前 L 个字节作为一帧写出（用于把粘在一起的多帧切开）。
+ * 剩余字节 memmove 到缓冲头部继续等待；时间戳按已消费字节数向后平移，
+ * 保证剩余帧的首字节时间仍然正确。参数 L 由 Modbus 扫描给出的边界决定。
+ */
 static void slice_frame(int index, int L)
 {
     frame_builder_t *builder = &s_builder[index];
@@ -471,9 +558,10 @@ static void slice_frame(int index, int L)
     }
 }
 
-// True when every port is between frames (nothing in mid-assembly). Any
-// blocking maintenance on the logger task must run only in such a window so it
-// can never postpone a frame's later bytes past the inter-frame gap.
+/* 判断所有通道是否都处于“帧间隙”（没有半帧在组装）。
+ * 返回 true 表示可以安全执行可能阻塞数毫秒的维护操作（磁盘统计、
+ * NVS 落盘、config.json 检查）而不破坏帧边界。
+ */
 static bool ports_idle(void)
 {
     for (int i = 0; i < APP_PORT_COUNT; i++) {
@@ -484,7 +572,9 @@ static bool ports_idle(void)
     return true;
 }
 
-// Wall time to shift one UART byte at the port's current configuration.
+/* 计算某通道传输一个字节所需的微秒数（按当前波特率与帧格式）。
+ * 返回值最小为 1，避免除零/负值；用于把“字节个数”换算成时间偏移。
+ */
 static int byte_time_us(int index)
 {
     const port_setting_t *ps = &s_port_cfg[index];
@@ -493,9 +583,11 @@ static int byte_time_us(int index)
     return us < 1 ? 1 : us;
 }
 
-// Wall-clock estimate for byte i in a chunk of len read at now_us. The last
-// byte finished arriving ~now; earlier bytes preceded it by one byte-time.
-// Deterministic (no jitter term), accurate to a fraction of one byte-time.
+/* 估算一批数据中第 i 个字节的到达时间，写入 builder->first。
+ * 原理：一批数据读到时最后一个字节刚到达（now_us），它之前的第 i 个字节
+ * 早 (chunk_len-1-i) 个字符时间，因此用当前墙钟回推。无随机抖动项，
+ * 误差小于 1 个字符时间，足以满足毫秒级时间戳需求。
+ */
 static void stamp_arrival(frame_builder_t *builder, int index,
                           int chunk_len, int i, int64_t now_us)
 {
@@ -511,8 +603,18 @@ static void stamp_arrival(frame_builder_t *builder, int index,
     }
 }
 
-// Append one contiguous byte range; force_flush ends the frame at its end.
-// burst_len/range_off describe the containing event for arrival estimation.
+/* 把一段连续字节追加进通道组装器（帧边界的基础逻辑）。
+ * 参数：
+ *   index       通道索引；
+ *   data/range_len 本次读到的字节范围；
+ *   burst_len/range_off 该范围所属事件的整体长度与偏移，用于时间戳回推；
+ *   now_us      读取时刻（esp_timer 微秒）；
+ *   force_flush true 时在范围末尾强制结束当前帧。
+ * 关键逻辑：
+ *   - 遇到 ASCII 帧起始符 ':' 且当前正在组帧，说明新帧开始，先输出旧帧；
+ *   - 缓冲达到 FRAME_BYTES 上限时强制输出，避免越界；
+ *   - 每字节都更新 last_us，供“长时间无后续字节”的硬超时判断。
+ */
 static void append_range(int index, const uint8_t *data, int range_len,
                          int burst_len, int range_off, int64_t now_us, bool force_flush)
 {
@@ -541,10 +643,19 @@ static void append_range(int index, const uint8_t *data, int range_len,
     }
 }
 
-// Append one driver-defined event's bytes and frame the accumulated builder:
-// grammar-valid slices are written as frames; an incomplete frame candidate
-// waits for continuation (hard-flushed by the loop gap timeout). Non-Modbus
-// data at a true frame gap is logged raw, unchanged.
+/* 处理一个 UART 事件携带的整批字节：先入组装器，再按 Modbus 语法切帧。
+ * 参数：
+ *   index    通道；
+ *   data/len 本次读到的字节；
+ *   now_us   读取时刻；
+ *   frame_end 该事件是否由 RX 超时产生（即真实帧间隙）。
+ * 切帧策略：
+ *   1. app_modbus_scan 找出缓冲内所有完整帧边界，逐个 slice_frame 输出；
+ *   2. 若尾部还可能是某帧前缀（app_modbus_prefix），继续等待后续字节；
+ *      否则在真实帧间隙处按原始 HEX 输出（非 Modbus 数据不做协议臆测）；
+ *   3. 最后把原始字节转发给 TCP/BLE 透传，并累加 rx_bytes、翻转活动灯。
+ * 异常/边界：语法扫描最多 8 个边界，防止极端输入造成长循环。
+ */
 static void append_burst(int index, const uint8_t *data, int len,
                          int64_t now_us, bool frame_end)
 {
@@ -587,7 +698,10 @@ static void append_burst(int index, const uint8_t *data, int len,
     }
 }
 
-// Consume one UART driver event.
+/* 消费一个 UART 驱动事件：UART_DATA 读出字节交给 append_burst；
+ * UART_BUFFER_FULL/FIFO_OVF 说明 RX 缓冲溢出，打印告警（数据可能丢失）。
+ * 一次事件只读一次，保持 ISR 定义的帧身份，不把多个事件合并读取。
+ */
 static void feed_uart_event(int index, const uart_event_t *ev)
 {
     if (ev->type == UART_DATA) {
@@ -624,9 +738,11 @@ static void writer_sync_all_locked(void)
     }
 }
 
-// Ordered barrier: kind 1 = flush+sync all files; kind 2 = close all files
-// (used before unmount). Writer signals after everything queued before this
-// message has been handled.
+/* 向磁盘写任务投递有序屏障并等待完成。
+ * 参数 kind：1=flush+fsync 所有文件；2=关闭所有文件（卸载卡前使用）。
+ * 返回 true=屏障已执行；false=队列满或 3 秒内未收到完成信号（超时）。
+ * 依靠消息队列的 FIFO 顺序保证屏障之前的写请求都已处理完毕。
+ */
 static bool writer_barrier(uint8_t kind)
 {
     disk_msg_t msg;
@@ -638,6 +754,14 @@ static bool writer_barrier(uint8_t kind)
     return xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(3000)) == pdTRUE;
 }
 
+/* 磁盘写任务：唯一持有日志 FILE* 的任务，串行消费 RX 路径投递的行。
+ * 消息类型：
+ *   0=普通行：ensure_file → fwrite，失败只累加 drop_lines（不影响接收）；
+ *   1=flush 屏障：flush+fsync 全部文件后回信号；
+ *   2=close 屏障：关闭全部文件后回信号（供卸载卡）。
+ * 另外每 2 秒做一次 durability sync，避免异常断电丢失过多行。
+ * 该任务栈与队列存储均在 PSRAM，且不使用中断 API，节省内部 RAM。
+ */
 static void writer_task(void *arg)
 {
     disk_msg_t msg;
@@ -691,6 +815,10 @@ static void writer_task(void *arg)
     }
 }
 
+/* SD 卡自检：写一个 bootcheck.txt → 回读首行 → 判定读写是否正常。
+ * 结果写入 s_sd_msg 并发布到界面；无卡或打开失败时给出中文提示。
+ * 全程持 app_fs_lock，与日志写入互斥。
+ */
 static void run_sd_test(void)
 {
     if (!app_sd_is_mounted()) {
@@ -731,6 +859,10 @@ static void run_sd_test(void)
     publish_sd();
 }
 
+/* 在锁保护下取出并清除各请求标志（reload/remount/sd_test/逐路 tx_test）。
+ * 这些接口由 UI、Web、命令行等其它任务调用，只置标志，真正的硬件操作
+ * 统一在 logger_task 里执行，避免跨任务操作 UART/文件系统。
+ */
 static void take_requests(bool *reload, bool *remount, bool *sd_test, bool tx_test[APP_PORT_COUNT])
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -747,7 +879,13 @@ static void take_requests(bool *reload, bool *remount, bool *sd_test, bool tx_te
     xSemaphoreGive(s_lock);
 }
 
-// Transmit one queued outbound frame in the logger context, then record it.
+/* 在 logger 上下文发送一帧并记录为 TX。
+ * 关键步骤：先 flush 当前半帧（避免把 TX 混进 RX 组装）；
+ *   uart_write_bytes → 等发送完成 → 读掉回环 echo 并清空对应事件，
+ *   防止自己发出的数据被当成 RX 再记一遍；
+ *   最后以当前时间写入 TX 帧并累加 tx_bytes/tx_frames。
+ * 异常处理：写入失败（wrote<=0）仍记录一条空的 TX 事件便于排查。
+ */
 static void execute_tx(int port, const uint8_t *data, int len)
 {
     flush_frame(port);
@@ -778,6 +916,10 @@ static void execute_tx(int port, const uint8_t *data, int len)
     }
 }
 
+/* 取出所有已排队的出站帧并在本任务发送（TCP/BLE/命令行的下发都走这里）。
+ * 每槽在锁内标记 used=false 后释放锁再真正写串口，避免持锁调用阻塞 API。
+ * 通道已关闭的请求直接丢弃，不报错。
+ */
 static void drain_txq(void)
 {
     for (int d = 0; d < TXQ_DEPTH; d++) {
@@ -795,6 +937,10 @@ static void drain_txq(void)
     }
 }
 
+/* 周期发送一步：若该通道使能且到达下次发送时刻，则发一行 "P<port> <seq>\\r\\n"。
+ * 参数 port 通道，now_us 当前微秒；间隔被限制为不小于 200ms（默认 1000ms）。
+ * 发送走 execute_tx，因此同样按 TX 记录并过滤回环。
+ */
 static void send_one_periodic(int port, int64_t now_us)
 {
     uint32_t interval_ms;
@@ -827,6 +973,11 @@ static void send_periodic(int64_t now_us)
     }
 }
 
+/* 每 2 秒检查一次 config.json 是否需要从运行时状态重新导出。
+ * 重要约束：stat/fopen/fread 会阻塞数毫秒，必须等所有通道处于帧间隙才执行，
+ * 否则会把同一帧的后半段推到帧间隙之后，造成一帧被拆成两帧。
+ * 未到空闲条件时不推进计时器，下一轮（1ms）立即重试。
+ */
 static void check_config_changes(int64_t now_us)
 {
     if (now_us - last_cfg_check_us < 2000000) {
@@ -852,6 +1003,12 @@ static void check_config_changes(int64_t now_us)
     }
 }
 
+/* 串口记录仪主循环（core 0，优先级 8）。
+ * 每轮依次处理：外部请求（重载/重挂载/自检/TX）→ 出站队列 → 周期发送
+ * → 逐通道消费 ISR 事件（每通道每轮最多 6 个，保证公平）→ 半帧硬超时
+ * → 空闲门控的维护任务（容量统计 30s、RTC 落盘 60s、config 检查 2s）。
+ * 调度节拍：有活动时 1ms，全空闲时 8ms，兼顾抓包时序与 CPU 占用。
+ */
 static void logger_task(void *arg)
 {
     int64_t last_sd_try_us = 0;
@@ -944,6 +1101,11 @@ static void logger_task(void *arg)
     }
 }
 
+/* 初始化记录仪：创建互斥锁、PSRAM 帧缓冲/行缓冲、磁盘写队列与任务，
+ * 最后启动 logger_task（core 0）。大块内存全部指定 MALLOC_CAP_SPIRAM，
+ * 保证内部 SRAM 留给 BLE/WiFi/httpd（否则易出现 NO_MEM 或 UI 任务创建失败）。
+ * 注意：本函数在 app_main 中必须先于 BLE/WiFi 初始化调用。
+ */
 void app_logger_start(void)
 {
     s_lock = xSemaphoreCreateMutex();
@@ -972,6 +1134,9 @@ void app_logger_start(void)
     xTaskCreatePinnedToCore(logger_task, "logger", 8192, NULL, 8, NULL, 0);
 }
 
+/* 复制一份当前运行状态快照给调用方（UI/Web/命令行）。
+ * 参数 out：外部提供的结构体；持锁整体拷贝，保证字段一致。
+ */
 void app_logger_get_view(app_view_t *out)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -979,6 +1144,9 @@ void app_logger_get_view(app_view_t *out)
     xSemaphoreGive(s_lock);
 }
 
+/* 请求重新加载串口参数（仅置标志，由 logger_task 真正执行）。
+ * 典型调用：Web /api/port、屏幕参数页保存、命令行 set 之后。
+ */
 void app_logger_request_reload(void)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -986,6 +1154,9 @@ void app_logger_request_reload(void)
     xSemaphoreGive(s_lock);
 }
 
+/* 请求重新挂载 SD 卡（热插拔/挂载失败后重试）。
+ * 实际动作在 logger_task 中先执行 close 屏障再 mount，避免文件仍在使用。
+ */
 void app_logger_request_remount(void)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -993,6 +1164,7 @@ void app_logger_request_remount(void)
     xSemaphoreGive(s_lock);
 }
 
+/* 请求执行一次 SD 读写自检（在 logger_task 中调用 run_sd_test）。 */
 void app_logger_request_sd_test(void)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -1000,6 +1172,9 @@ void app_logger_request_sd_test(void)
     xSemaphoreGive(s_lock);
 }
 
+/* 请求在某通道发送一次固定测试帧 55 AA 01 02 03（由 logger_task 执行）。
+ * 参数 port 越界时直接忽略。
+ */
 void app_logger_request_tx_test(int port)
 {
     if (port < 0 || port >= APP_PORT_COUNT) {
@@ -1010,6 +1185,10 @@ void app_logger_request_tx_test(int port)
     xSemaphoreGive(s_lock);
 }
 
+/* 开启某通道的周期发送并重置该通道统计。
+ * 参数：port 通道；interval_ms 发送间隔（<200ms 时按 200ms 处理）。
+ * 同时清零 tx/rx/drop 计数，便于观察本轮周期的收发情况。
+ */
 void app_logger_set_periodic_tx(int port, uint32_t interval_ms)
 {
     if (port < 0 || port >= APP_PORT_COUNT) {
@@ -1031,6 +1210,7 @@ void app_logger_set_periodic_tx(int port, uint32_t interval_ms)
     xSemaphoreGive(s_lock);
 }
 
+/* 停止指定通道的周期发送（仅置标志，发送循环下一轮自然停止）。 */
 void app_logger_stop_periodic_tx_port(int port)
 {
     if (port < 0 || port >= APP_PORT_COUNT) {
@@ -1042,6 +1222,7 @@ void app_logger_stop_periodic_tx_port(int port)
     xSemaphoreGive(s_lock);
 }
 
+/* 停止全部通道的周期发送。 */
 void app_logger_stop_periodic_tx(void)
 {
     for (int port = 0; port < APP_PORT_COUNT; port++) {
@@ -1049,6 +1230,11 @@ void app_logger_stop_periodic_tx(void)
     }
 }
 
+/* 将一帧数据加入出站队列，由 logger_task 发出并记为 TX。
+ * 参数：port 通道；data/len 待发数据（len 超过 FRAME_BYTES 截断）。
+ * 返回 true=入队成功；false=参数非法或队列（深度 2）已满。
+ * 线程安全：可在任意任务调用（TCP/BLE/命令行），队列满时调用方应丢弃或重试。
+ */
 bool app_logger_request_tx(int port, const uint8_t *data, int len)
 {
     if (port < 0 || port >= APP_PORT_COUNT || !data || len <= 0) {
@@ -1073,6 +1259,9 @@ bool app_logger_request_tx(int port, const uint8_t *data, int len)
     return queued;
 }
 
+/* 调试注入：把最多 32 字节直接排入出站队列（命令行 inject 使用）。
+ * 与 app_logger_request_tx 行为一致，仅额外限制长度。
+ */
 void app_logger_inject(int port, const uint8_t *data, int len)
 {
     if (len > 32) {
@@ -1081,6 +1270,13 @@ void app_logger_inject(int port, const uint8_t *data, int len)
     app_logger_request_tx(port, data, len);
 }
 
+/* 读取某通道自 since 游标之后的实时文本（增量，供网页轮询）。
+ * 参数：
+ *   index   通道；since 上次返回的 next 游标（0=从最近 600 字符开始）；
+ *   out/out_len 输出缓冲，超出部分截断；next 回传本次结束游标。
+ * 边界处理：游标早于环形缓冲有效范围时自动跳到最旧可用位置，
+ * 游标超过写指针时钳到末尾，保证不会读到旧数据或越界。
+ */
 void app_logger_live_get(int index, uint32_t since, char *out, size_t out_len, uint32_t *next)
 {
     if (!out || out_len == 0) {
@@ -1116,6 +1312,10 @@ void app_logger_live_get(int index, uint32_t since, char *out, size_t out_len, u
     xSemaphoreGive(s_lock);
 }
 
+/* 强制把队列中已产生的日志全部落盘（下载/打包前调用）。
+ * 通过 flush 屏障等待写任务处理完之前的所有消息；最多等待 3 秒，
+ * 超时也不阻塞调用方（下载到的文件可能缺少最后一小段）。
+ */
 void app_logger_flush(void)
 {
     if (s_diskq) {
@@ -1123,6 +1323,10 @@ void app_logger_flush(void)
     }
 }
 
+/* 把各路正在组装的半帧推入写队列并等待全部落盘。
+ * 供卸载 SD 卡/OTA 前使用；文件保持打开（由写任务持有），
+ * 其它读者仍可并发打开同一文件读取。
+ */
 void app_logger_release_files(void)
 {
     // Push any in-flight assembly into the writer queue, then wait until all

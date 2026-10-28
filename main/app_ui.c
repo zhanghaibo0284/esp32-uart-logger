@@ -514,7 +514,7 @@ static void build_log(lv_obj_t *tab)
     make_btn(tab, "重新挂载", on_remount);
     make_btn(tab, "写入测试帧", on_inject);
     make_btn(tab, "发送测试", on_tx);
-    make_label(tab, "路径 /sdcard/UARTx/");
+    make_label(tab, "路径 /sdcard/YYYY-MM-DD/UARTx/");
     make_label(tab, "格式 时间: AA BB CC");
     s_log_msg = make_label(tab, "十六进制存储");
 }

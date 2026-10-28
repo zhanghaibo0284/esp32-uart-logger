@@ -24,7 +24,9 @@ typedef struct {
         uint64_t tx_bytes;
         bool sending;
         char param[24];
-        char file_name[24];
+        // 日志文件相对路径（相对 /sdcard），形如 "2026-10-27/UART0/20261027_120000.txt"。
+        // 用于活动文件判断（is_active_log_file）与控制台显示；放 64 字节以容纳日期+通道+文件名。
+        char file_name[64];
     } port[APP_PORT_COUNT];
 } app_view_t;
 

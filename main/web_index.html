@@ -23,6 +23,18 @@ button{background:#2f6fed;color:#fff;border:0;border-radius:8px;padding:12px 14p
 .msg{min-height:1.2em;color:#ffd27a}
 #live{height:240px;overflow:auto;background:#0b0f14;padding:8px;white-space:pre-wrap;font:13px/1.35 ui-monospace,monospace}
 #cfg-file{width:auto;padding:0;background:none;border-radius:0}
+button.danger{background:#c0392b}
+button.small{padding:6px 10px;margin:0}
+.file-meta{color:#9aa8b8;font-size:13px;white-space:nowrap}
+#f-date,#f-kw{width:auto}
+#pager{gap:8px;margin-top:8px}
+#pager button{padding:8px 12px;margin:0}
+#pager .muted{font-size:13px}
+#files{height:420px;max-height:60vh;overflow-y:auto;background:#0b0f14;border-radius:8px;padding:0 6px;position:relative;-webkit-overflow-scrolling:touch}
+#files-ph{position:relative}
+#files .line{position:absolute;left:0;right:0;height:38px;margin:0;padding:0 2px;box-sizing:border-box}
+#files .item{padding:7px 10px;font-size:14px;line-height:22px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#files .file-meta{font-size:12px}
 </style>
 </head>
 <body>
@@ -65,12 +77,32 @@ button{background:#2f6fed;color:#fff;border:0;border-radius:8px;padding:12px 14p
 <div id="time-msg" class="msg"></div>
 </div>
 <div class="card">
-<h2>日志文件</h2>
-<div id="crumb" class="muted"></div>
-<button type="button" id="btn-all">全选</button>
+<h2>数据记录</h2>
+<div class="muted">可分批加载并浏览 TF 卡内全部日志记录（不再限制 100 条），支持按通道、日期、关键词筛选和时间/名称/大小排序；列表采用虚拟滚动，文件很多也不会卡顿。删除会立即从 TF 卡移除文件且不可恢复，正在写入的日志会自动跳过。</div>
+<div class="row">
+<label>通道 <select id="f-channel"><option value="all">全部</option><option value="0">U0</option><option value="1">J2</option><option value="2">J3</option></select></label>
+<label>日期 <input id="f-date" type="date"></label>
+<label>关键词 <input id="f-kw" placeholder="文件名"></label>
+<label>排序 <select id="f-sort"><option value="time">时间</option><option value="name">名称</option><option value="size">大小</option></select></label>
+<label>顺序 <select id="f-order"><option value="desc">降序</option><option value="asc">升序</option></select></label>
+<label>每批 <select id="f-per"><option value="200">200</option><option value="500" selected>500</option><option value="1000">1000</option></select></label>
+<button type="button" id="f-apply">应用筛选</button>
+</div>
+<div class="row">
+<button type="button" id="btn-all">全选已加载</button>
 <button type="button" id="btn-zip">下载选中</button>
 <button type="button" id="btn-zipall">下载全部</button>
-<div id="files"></div>
+<button type="button" id="btn-del" class="danger">删除选中</button>
+</div>
+<div id="crumb" class="muted"></div>
+<div class="row">
+  <label>路径 <input id="f-path" style="width:240px" placeholder="/sdcard/..."></label>
+  <button type="button" id="f-goto">跳转</button>
+  <button type="button" id="f-root">根目录</button>
+  <button type="button" id="f-records">全部记录视图</button>
+</div>
+<div id="files"><div id="files-ph"></div></div>
+<div class="row" id="pager"></div>
 <div id="file-msg" class="msg"></div>
 </div>
 <div class="card">
@@ -91,7 +123,6 @@ button{background:#2f6fed;color:#fff;border:0;border-radius:8px;padding:12px 14p
 <script>
 const names=["U0 板载","J2","J3"];
 const bauds=[115200,9600,19200,38400,57600,230400,460800,921600,4800,2400,1200];
-let cur="/sdcard";
 let ports=[];
 function opts(list,val){
   return list.map(function(v){
@@ -200,12 +231,6 @@ function safeDir(path){
   if(!path || path.indexOf('/sdcard')!==0 || path.indexOf('..')>=0) return '/sdcard';
   return path;
 }
-function upPath(path){
-  path=safeDir(path);
-  if(path==='/sdcard') return '/sdcard';
-  var i=path.lastIndexOf('/');
-  return i<=7?'/sdcard':path.slice(0,i);
-}
 function renderCrumb(path){
   var box=document.getElementById('crumb');
   box.innerHTML='';
@@ -225,66 +250,257 @@ function renderCrumb(path){
     a.setAttribute('data-path',acc);
     box.appendChild(a);
   });
+  // 同步路径输入框，便于用户编辑后跳转到任意目录。
+  var pin=document.getElementById('f-path');
+  if(pin) pin.value=path;
 }
-async function loadFiles(path){
-  cur=safeDir(path);
-  show('file-msg','');
-  try{
-    const r=await fetch('/api/files?path='+encodeURIComponent(cur));
-    const s=await r.json();
-    if(s.err){ show('file-msg', s.err); }
-    var shown=safeDir(s.path||cur);
-    cur=shown;
-    renderCrumb(shown);
-    var box=document.getElementById('files');
-    box.innerHTML='';
-    if(shown!=='/sdcard'){
-      var back=document.createElement('a');
-      back.className='item';
-      back.textContent='.. 返回';
-      back.href='/?dir='+encodeURIComponent(upPath(shown));
-      back.setAttribute('data-dir','1');
-      back.setAttribute('data-path', upPath(shown));
-      var line0=document.createElement('div');
-      line0.className='line';
-      line0.appendChild(back);
-      box.appendChild(line0);
-    }
-    (s.items||[]).forEach(function(it){
-      var full=shown+'/'+it.name;
-      var line=document.createElement('div');
-      line.className='line';
-      if(!it.dir){
-        var ck=document.createElement('input');
-        ck.type='checkbox';
-        ck.className='pick';
-        ck.setAttribute('data-name', it.name);
-        line.appendChild(ck);
-      }
+// ---- 数据记录：全量分批加载 + 虚拟滚动（保留筛选/排序/选择/导出/删除） ----
+var FROW=38, FOVER=8;                 // 行高与视口上下额外渲染的行数
+var fstate={path:'/sdcard',sort:'time',order:'desc',channel:'all',date:'',kw:'',batch:500,records:false};
+var fdata=[];        // 已加载条目（服务端已按当前条件排序）
+var ftotal=0;        // 筛选后的总条数
+var floading=false;  // 是否有请求在进行
+var fdone=false;     // 是否已加载完全部
+var ftrunc=false;    // 服务端索引是否达到容量上限
+var fsel={};         // 选中集合：相对名 -> true（跨滚动窗口保持）
+var fseq=0;          // 加载代次：丢弃过期响应，避免快速切换筛选时串数据
+var fwinFirst=-1, fwinLast=-1;   // 当前已渲染的窗口区间，未变化时跳过重绘
+function fmtSize(n){
+  if(n>=1048576) return (n/1048576).toFixed(1)+' MB';
+  if(n>=1024) return (n/1024).toFixed(1)+' KB';
+  return n+' B';
+}
+function fmtTime(sec){
+  if(!sec || sec<946684800) return '';
+  var d=new Date(sec*1000);
+  function p(v){return v<10?('0'+v):(''+v);}
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+}
+function fileFull(rel){
+  return (fstate.path==='/'?'':fstate.path)+'/'+rel;
+}
+function fileDirName(rel){
+  var full=fileFull(rel);
+  var i=full.lastIndexOf('/');
+  return {dir: full.slice(0,i)||'/sdcard', name: full.slice(i+1)};
+}
+// 只渲染滚动窗口内的行：DOM 节点始终只有几十个，
+// 即使已加载上万条也不会造成页面卡顿或内存暴涨。
+function renderFiles(force){
+  var box=document.getElementById('files');
+  var ph=document.getElementById('files-ph');
+  if(!fdata.length){
+    fwinFirst=-1; fwinLast=-1;
+    ph.style.height='40px';
+    ph.innerHTML='';
+    var empty=document.createElement('div');
+    empty.className='muted';
+    empty.style.padding='10px';
+    empty.textContent=floading?'正在读取...':'暂无记录';
+    ph.appendChild(empty);
+    return;
+  }
+  ph.style.height=(fdata.length*FROW)+'px';
+  var first=Math.max(0, Math.floor(box.scrollTop/FROW)-FOVER);
+  var last=Math.min(fdata.length, Math.ceil((box.scrollTop+box.clientHeight)/FROW)+FOVER);
+  if(!force && first===fwinFirst && last===fwinLast) return;
+  fwinFirst=first; fwinLast=last;
+  var frag=document.createDocumentFragment();
+  for(var i=first;i<last;i++){
+    var it=fdata[i];
+    var line=document.createElement('div');
+    line.className='line';
+    line.style.top=(i*FROW)+'px';
+    if(it.dir){
       var a=document.createElement('a');
       a.className='item';
-      if(it.dir){
-        a.textContent=it.name+'/';
-        a.href='/?dir='+encodeURIComponent(full);
-        a.setAttribute('data-dir','1');
-        a.setAttribute('data-path', full);
-      }else{
-        a.textContent=it.name+'  '+it.size;
-        a.href='/dl?path='+encodeURIComponent(full);
-      }
+      a.textContent=it.name+'/';
+      a.href='/?dir='+encodeURIComponent(fileFull(it.name));
+      a.setAttribute('data-dir','1');
+      a.setAttribute('data-path', fileFull(it.name));
       line.appendChild(a);
-      box.appendChild(line);
-    });
-    if(!(s.items||[]).length){
-      var empty=document.createElement('div');
-      empty.className='muted';
-      empty.textContent='空';
-      box.appendChild(empty);
+      var dl=document.createElement('button');
+      dl.type='button';
+      dl.className='small';
+      dl.textContent='下载';
+      dl.setAttribute('data-dl-dir', it.name);
+      line.appendChild(dl);
+    }else{
+      var ck=document.createElement('input');
+      ck.type='checkbox';
+      ck.className='pick';
+      ck.checked=!!fsel[it.name];
+      ck.setAttribute('data-name', it.name);
+      line.appendChild(ck);
+      var link=document.createElement('a');
+      link.className='item';
+      link.textContent=it.name;
+      link.href='/dl?path='+encodeURIComponent(fileFull(it.name));
+      line.appendChild(link);
+      var meta=document.createElement('span');
+      meta.className='file-meta';
+      meta.textContent=fmtSize(it.size||0)+(it.mtime?('  '+fmtTime(it.mtime)):'');
+      line.appendChild(meta);
+      var del=document.createElement('button');
+      del.type='button';
+      del.className='danger small';
+      del.textContent='删除';
+      del.setAttribute('data-del', it.name);
+      line.appendChild(del);
     }
-  }catch(e){
-    show('file-msg','目录读取失败');
+    frag.appendChild(line);
+  }
+  ph.innerHTML='';
+  ph.appendChild(frag);
+}
+// 状态栏：已加载/总数 + 加载全部 + 刷新
+function renderStatus(){
+  var box=document.getElementById('pager');
+  box.innerHTML='';
+  var info=document.createElement('span');
+  info.className='muted';
+  var txt='已加载 '+fdata.length+' / 共 '+ftotal+' 条';
+  if(floading) txt+='（读取中…）';
+  if(ftrunc) txt+='；已达索引上限，请用筛选缩小范围';
+  info.textContent=txt;
+  box.appendChild(info);
+  if(!fdone && fdata.length){
+    var all=document.createElement('button');
+    all.type='button';
+    all.textContent='加载全部';
+    all.onclick=loadAll;
+    box.appendChild(all);
+  }
+  var rel=document.createElement('button');
+  rel.type='button';
+  rel.textContent='刷新';
+  rel.onclick=function(){ loadFiles(fstate.path); };
+  box.appendChild(rel);
+}
+function loadedFileNames(){
+  var out=[];
+  for(var i=0;i<fdata.length;i++){ if(!fdata[i].dir) out.push(fdata[i].name); }
+  return out;
+}
+function renderSelButtons(){
+  var names=loadedFileNames();
+  var selCount=Object.keys(fsel).length;
+  var all=names.length>0 && names.every(function(n){ return fsel[n]; });
+  var a=document.getElementById('btn-all');
+  if(a) a.textContent=all?'取消全选':'全选已加载';
+  var d=document.getElementById('btn-del');
+  if(d) d.textContent=selCount?('删除选中('+selCount+')'):'删除选中';
+}
+function fileQuery(offset){
+  var q={
+    path:fstate.path, offset:String(offset), per_page:String(fstate.batch),
+    sort:fstate.sort, order:fstate.order, channel:fstate.channel,
+    date:fstate.date, kw:fstate.kw
+  };
+  if(fstate.records) q.rec='1';
+  return new URLSearchParams(q).toString();
+}
+// 拉取一批记录。带 8 秒超时：设备忙/网络差时主动中断，
+// 避免请求永远挂起把界面卡在“读取中…”。
+async function fetchBatch(offset){
+  var ctl=null, timer=0;
+  try{
+    ctl=new AbortController();
+    timer=setTimeout(function(){ ctl.abort(); }, 8000);
+    var r=await fetch('/api/files?'+fileQuery(offset), {signal:ctl.signal, cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return await r.json();
+  }finally{
+    if(timer) clearTimeout(timer);
   }
 }
+// 重新加载第一批：换目录 / 改筛选 / 刷新 / 删除后调用。
+// keepScroll=true 时尽量恢复原滚动位置（单条删除后保留浏览位置）。
+async function loadFiles(path, keepScroll){
+  if(path!==undefined) fstate.path=safeDir(path);
+  var box=document.getElementById('files');
+  var keep=keepScroll?box.scrollTop:0;
+  fseq++;
+  var my=fseq;
+  fdata=[]; ftotal=0; fdone=false; ftrunc=false; floading=true; fsel={};
+  fwinFirst=-1; fwinLast=-1;
+  box.scrollTop=0;
+  show('file-msg','');
+  renderFiles(true); renderStatus(); renderSelButtons();
+  try{
+    var s=await fetchBatch(0);
+    if(my!==fseq) return;
+    if(s.err){
+      show('file-msg', s.err);
+      fdone=true;
+    }else{
+      fstate.path=safeDir(s.path||fstate.path);
+      ftotal=s.total||0;
+      ftrunc=!!s.truncated;
+      fdata=s.items||[];
+      fdone=fdata.length>=ftotal;
+      renderCrumb(fstate.path);
+      box.scrollTop=keep;
+    }
+  }catch(e){
+    if(my!==fseq) return;
+    show('file-msg', e && e.name==='AbortError'
+      ? '读取超时（设备无响应），请检查连接后点“刷新”重试'
+      : '记录读取失败，请点“刷新”重试');
+    fdone=true;
+  }
+  floading=false;
+  renderFiles(true); renderStatus(); renderSelButtons();
+}
+// 按 offset 追加下一批；滚动到底部时自动触发
+async function loadMore(){
+  if(floading || fdone) return;
+  var my=fseq;
+  floading=true;
+  renderStatus();
+  try{
+    var s=await fetchBatch(fdata.length);
+    if(my!==fseq) return;
+    var items=s.items||[];
+    for(var i=0;i<items.length;i++) fdata.push(items[i]);
+    ftotal=s.total||ftotal;
+    ftrunc=!!s.truncated;
+    fdone=!items.length || fdata.length>=ftotal;
+  }catch(e){
+    if(my!==fseq) return;
+    fdone=true;
+    show('file-msg', e && e.name==='AbortError'
+      ? '分批加载超时，请点“刷新”重试'
+      : '分批加载失败，请点“刷新”重试');
+  }
+  floading=false;
+  renderFiles(true); renderStatus(); renderSelButtons();
+}
+// 「加载全部」：循环拉取所有批次直到取完（期间状态栏显示进度）
+async function loadAll(){
+  if(floading) return;
+  show('file-msg','正在加载全部记录…');
+  while(!fdone && !floading){
+    await loadMore();
+  }
+  show('file-msg', fdone?('已加载全部 '+fdata.length+' 条'):'');
+}
+function applyFilters(){
+  fstate.channel=document.getElementById('f-channel').value;
+  fstate.date=document.getElementById('f-date').value||'';
+  fstate.kw=document.getElementById('f-kw').value.trim();
+  fstate.sort=document.getElementById('f-sort').value;
+  fstate.order=document.getElementById('f-order').value;
+  fstate.batch=Number(document.getElementById('f-per').value)||500;
+  loadFiles();
+}
+document.getElementById('f-apply').addEventListener('click', applyFilters);
+document.getElementById('f-kw').addEventListener('keydown', function(ev){ if(ev.key==='Enter') applyFilters(); });
+document.getElementById('f-sort').addEventListener('change', applyFilters);
+document.getElementById('f-order').addEventListener('change', applyFilters);
+document.getElementById('f-per').addEventListener('change', applyFilters);
+document.getElementById('f-channel').addEventListener('change', applyFilters);
+document.getElementById('f-date').addEventListener('change', applyFilters);
 function onDirClick(ev){
   var node=ev.target;
   while(node && node.tagName!=='A') node=node.parentNode;
@@ -294,33 +510,201 @@ function onDirClick(ev){
 }
 document.getElementById('crumb').addEventListener('click', onDirClick);
 document.getElementById('files').addEventListener('click', onDirClick);
+// 滚动时按帧重绘可视行；接近底部时自动追加下一批
+var fRAF=0;
+document.getElementById('files').addEventListener('scroll', function(){
+  if(!fRAF){
+    fRAF=requestAnimationFrame(function(){ fRAF=0; renderFiles(false); });
+  }
+  var box=document.getElementById('files');
+  if(box.scrollTop+box.clientHeight>=box.scrollHeight-160) loadMore();
+});
+window.addEventListener('resize', function(){ renderFiles(true); });
+// 全选/取消全选：作用范围是“已加载”的全部文件（不受虚拟滚动可视范围影响）
 document.getElementById('btn-all').addEventListener('click', function(){
-  var boxes=document.querySelectorAll('#files .pick');
-  var mark=false;
-  for(var i=0;i<boxes.length;i++){ if(!boxes[i].checked) mark=true; }
-  for(var j=0;j<boxes.length;j++) boxes[j].checked=mark;
+  var names=loadedFileNames();
+  var all=names.length>0 && names.every(function(n){ return fsel[n]; });
+  if(all){
+    fsel={};
+  }else{
+    names.forEach(function(n){ fsel[n]=true; });
+  }
+  renderFiles(true);
+  renderSelButtons();
+});
+// 勾选变化写入选中集合，跨滚动窗口保持
+document.getElementById('files').addEventListener('change', function(ev){
+  var t=ev.target;
+  if(!t || t.className!=='pick') return;
+  var nm=t.getAttribute('data-name');
+  if(!nm) return;
+  if(t.checked){ fsel[nm]=true; } else { delete fsel[nm]; }
+  renderSelButtons();
 });
 function selectedNames(){
-  var names=[];
-  var boxes=document.querySelectorAll('#files .pick');
-  for(var i=0;i<boxes.length;i++){
-    if(boxes[i].checked) names.push(boxes[i].getAttribute('data-name'));
+  return Object.keys(fsel);
+}
+// 从 Content-Disposition 里解析出 filename（优先 filename*=UTF-8''）
+function parseFileName(cd){
+  if(!cd) return 'archive.zip';
+  var m=cd.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+  if(m) try{ return decodeURIComponent(m[1]); }catch(e){}
+  m=cd.match(/filename\s*=\s*"([^"]+)"/i);
+  if(m) return m[1];
+  m=cd.match(/filename\s*=\s*([^;]+)/i);
+  if(m) return m[1].trim();
+  return 'archive.zip';
+}
+// ZIP 下载：流式读取响应体，边收边在状态栏显示已收字节数，
+// 既支持大文件夹打包不会因长时间无反馈导致界面“假死”，
+// 又能在服务端返回 404/413 时给出明确错误提示。
+async function downloadZip(url){
+  show('file-msg','正在打包，请稍候…');
+  try{
+    var r=await fetch(url);
+    if(!r.ok){
+      var t=await r.text();
+      if(r.status===413) show('file-msg','文件太多无法一次打包，请按通道/日期/关键词筛选后再试');
+      else show('file-msg','打包失败：'+(t||r.status));
+      return;
+    }
+    var name=parseFileName(r.headers.get('Content-Disposition'));
+    if(!r.body){
+      var blob0=await r.blob();
+      saveBlob(blob0, name);
+      show('file-msg','打包完成：'+fmtSize(blob0.size));
+      return;
+    }
+    var reader=r.body.getReader();
+    var chunks=[];
+    var got=0;
+    for(;;){
+      var res=await reader.read();
+      if(res.done) break;
+      chunks.push(res.value);
+      got+=res.value.length;
+      show('file-msg','正在下载：已收 '+fmtSize(got)+' …');
+    }
+    var blob=new Blob(chunks, {type:'application/zip'});
+    saveBlob(blob, name);
+    show('file-msg','打包完成：'+fmtSize(got)+' → '+name);
+  }catch(e){
+    show('file-msg', e && e.name==='AbortError'
+      ? '下载超时，请检查连接后重试' : '打包请求无响应');
   }
-  return {names:names, total:boxes.length};
+}
+function saveBlob(blob, name){
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=name||'logs.zip';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function(){ URL.revokeObjectURL(a.href); }, 30000);
+}
+// 下载某个子文件夹：把该目录下所有层级的文件打包成 ZIP。
+function downloadFolder(rel){
+  var full=fileFull(rel);
+  show('file-msg','正在打包文件夹：'+rel);
+  downloadZip('/api/zip?dir='+encodeURIComponent(full)+'&all=1');
+}
+function zipParams(){
+  return 'channel='+encodeURIComponent(fstate.channel)+
+         '&date='+encodeURIComponent(fstate.date)+
+         '&kw='+encodeURIComponent(fstate.kw);
 }
 document.getElementById('btn-zip').addEventListener('click', function(){
-  var sel=selectedNames();
-  if(!sel.names.length){ show('file-msg','请选择文件'); return; }
-  if(sel.names.length===sel.total){
-    window.location.href='/api/zip?dir='+encodeURIComponent(cur)+'&all=1';
-    return;
-  }
-  var q='/api/zip?dir='+encodeURIComponent(cur)+'&names='+encodeURIComponent(sel.names.join('|'));
-  if(q.length>1500){ show('file-msg','选中太多,请用下载全部'); return; }
-  window.location.href=q;
+  var names=selectedNames();
+  if(!names.length){ show('file-msg','请选择要下载的记录'); return; }
+  var q='/api/zip?dir='+encodeURIComponent(fstate.path)+'&names='+encodeURIComponent(names.join('|'));
+  if(q.length>3200){ show('file-msg','选中文件过多，请分批下载或改用“下载全部”'); return; }
+  downloadZip(q);
 });
+// “下载全部”= 当前目录下所有层级的文件全部打包（含子目录）
 document.getElementById('btn-zipall').addEventListener('click', function(){
-  window.location.href='/api/zip?dir='+encodeURIComponent(cur)+'&all=1';
+  downloadZip('/api/zip?dir='+encodeURIComponent(fstate.path)+'&all=1&'+zipParams());
+});
+// 路径导航
+document.getElementById('f-goto').addEventListener('click', function(){
+  var v=document.getElementById('f-path').value.trim();
+  if(!v) v='/sdcard';
+  loadFiles(v);
+});
+document.getElementById('f-root').addEventListener('click', function(){
+  loadFiles('/sdcard');
+});
+document.getElementById('f-records').addEventListener('click', function(){
+  fstate.records=!fstate.records;
+  document.getElementById('f-records').textContent=fstate.records?'返回目录视图':'全部记录视图';
+  loadFiles(fstate.path);
+});
+// 文件夹“下载”按钮（事件委托，因虚拟滚动只渲染可视行）
+document.getElementById('files').addEventListener('click', function(e){
+  var t=e.target;
+  if(t && t.getAttribute && t.getAttribute('data-dl-dir')){
+    e.preventDefault();
+    downloadFolder(t.getAttribute('data-dl-dir'));
+  }
+});
+// 批量删除：按目录分组、每批 40 条串行提交，最后汇总成功/失败原因
+async function deleteSelected(){
+  var names=selectedNames();
+  if(!names.length){ show('file-msg','请先勾选要删除的记录'); return; }
+  if(!window.confirm('确定删除选中的 '+names.length+' 条记录？\n删除后不可恢复。')) return;
+  show('file-msg','正在删除...');
+  // 记录模式下列表可能跨 UART0/1/2 多个目录，按目录分组后逐批提交。
+  var groups={};
+  names.forEach(function(rel){
+    var p=fileDirName(rel);
+    (groups[p.dir]=groups[p.dir]||[]).push(p.name);
+  });
+  var ok=0, bad=0, reasons=[];
+  try{
+    var dirs=Object.keys(groups);
+    for(var d=0; d<dirs.length; d++){
+      var list=groups[dirs[d]];
+      for(var i=0;i<list.length;i+=40){
+        var part=list.slice(i,i+40);
+        var s=await apiGet('/api/delete?dir='+encodeURIComponent(dirs[d])+'&names='+encodeURIComponent(part.join('|')));
+        ok+=(s.deleted||0);
+        bad+=(s.failed||0);
+        (s.items||[]).forEach(function(it){ if(!it.ok) reasons.push(it.name+'：'+(it.err||'失败')); });
+      }
+    }
+    var msg='删除完成：成功 '+ok+' 条，失败 '+bad+' 条';
+    if(reasons.length) msg+='（'+reasons.slice(0,3).join('；')+(reasons.length>3?' 等':'')+'）';
+    show('file-msg', msg);
+  }catch(e){
+    show('file-msg','删除请求无响应');
+  }
+  // 无论成败都刷新：已删除项消失，失败项继续保留在列表中
+  await loadFiles(fstate.path);
+}
+document.getElementById('btn-del').addEventListener('click', deleteSelected);
+// 单条删除：二次确认 → 调接口 → 提示结果 → 保留滚动位置刷新
+async function deleteOne(rel){
+  var p=fileDirName(rel);
+  if(!window.confirm('确定删除这条记录？\n'+rel+'\n删除后不可恢复。')) return;
+  show('file-msg','正在删除...');
+  try{
+    var s=await apiGet('/api/delete?dir='+encodeURIComponent(p.dir)+'&name='+encodeURIComponent(p.name));
+    if(s.deleted===1) show('file-msg','删除成功：'+rel);
+    else{
+      var why='失败';
+      (s.items||[]).forEach(function(it){ if(!it.ok) why=it.err||'失败'; });
+      show('file-msg','删除失败：'+why);
+    }
+  }catch(e){
+    show('file-msg','删除请求无响应');
+  }
+  await loadFiles(fstate.path, true);
+}
+document.getElementById('files').addEventListener('click', function(ev){
+  var node=ev.target;
+  while(node && node.tagName!=='BUTTON') node=node.parentNode;
+  if(!node || !node.getAttribute) return;
+  var rel=node.getAttribute('data-del');
+  if(rel){ deleteOne(rel); }
 });
 document.getElementById('btn-phone').addEventListener('click', async function(){
   var d=new Date();

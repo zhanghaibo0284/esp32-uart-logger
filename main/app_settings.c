@@ -31,6 +31,9 @@ typedef struct {
 static app_settings_t s_cfg;
 static SemaphoreHandle_t s_lock;
 
+/* 填充出厂默认配置：分段 60 分钟，屏幕自动熄屏开启；
+ * 三路均 115200-8N1，默认只启用 J2（UART1），其余关闭。
+ */
 static void set_defaults(app_settings_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
@@ -46,11 +49,16 @@ static void set_defaults(app_settings_t *cfg)
     cfg->port[1].enabled = true;
 }
 
+/* 校验波特率范围（300..2000000）：超出范围视为非法，回退默认值。 */
 static bool baud_ok(uint32_t baud)
 {
     return baud >= 300 && baud <= 2000000;
 }
 
+/* 校验 NVS blob 是否可信：magic 必须匹配，版本支持 v2（旧布局）与当前版本，
+ * 分段 1..1440 分钟，逐路检查波特率/数据位/停止位/校验枚举范围。
+ * 任一项越界返回 false，调用方会回退默认配置，避免把非法值送进 UART 驱动。
+ */
 static bool blob_ok(const cfg_blob_t *blob)
 {
     if (blob->magic != CFG_MAGIC ||
@@ -79,6 +87,7 @@ static bool blob_ok(const cfg_blob_t *blob)
     return true;
 }
 
+/* blob → 运行结构体（含 v2 兼容：v2 没有 screen_auto_off 字段，默认开启熄屏）。 */
 static void from_blob(const cfg_blob_t *blob, app_settings_t *cfg)
 {
     cfg->segment_min = blob->segment_min;
@@ -93,6 +102,7 @@ static void from_blob(const cfg_blob_t *blob, app_settings_t *cfg)
     }
 }
 
+/* 运行结构体 → blob（写入 magic 与当前版本，清零未使用字节保证布局稳定）。 */
 static void to_blob(const app_settings_t *cfg, cfg_blob_t *blob)
 {
     memset(blob, 0, sizeof(*blob));
@@ -109,6 +119,9 @@ static void to_blob(const app_settings_t *cfg, cfg_blob_t *blob)
     }
 }
 
+/* 把端口参数格式化为简短文本（如 "115200 8N1"），供界面显示。
+ * 参数：port 端口参数；out/out_len 输出缓冲（建议 >=24 字节）。
+ */
 void app_settings_format_port(const port_setting_t *port, char *out, size_t out_len)
 {
     int bits = 8;
@@ -134,6 +147,9 @@ void app_settings_format_port(const port_setting_t *port, char *out, size_t out_
     snprintf(out, out_len, "%lu %d%s%s", (unsigned long)port->baud, bits, parity, stop);
 }
 
+/* 初始化配置模块：创建锁、装入默认值，再尝试从 NVS（namespace "logger",
+ * key "cfg"）读取并校验；任何一步不合法都保留默认值继续启动，不阻塞开机。
+ */
 void app_settings_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
@@ -159,6 +175,7 @@ void app_settings_init(void)
     }
 }
 
+/* 复制当前配置快照（持锁整体拷贝，保证字段一致）。 */
 void app_settings_get(app_settings_t *out)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -166,6 +183,13 @@ void app_settings_get(app_settings_t *out)
     xSemaphoreGive(s_lock);
 }
 
+/* 保存配置：先做合法性钳制（分段 1..1440 分钟、波特率 300..2000000），
+ * 再更新内存快照，最后整体写入 NVS。
+ * 注意：本函数只改配置，不会立刻按新参数重开串口；调用方通常随后执行
+ *       app_logger_request_reload() 让参数生效。
+ * 异常处理：NVS 打开失败记录错误并返回（内存值已更新，下次启动回退旧值）；
+ *           set/commit 失败由 ESP_ERROR_CHECK 直接复位，保证数据一致。
+ */
 void app_settings_save(const app_settings_t *in)
 {
     app_settings_t cfg = *in;
